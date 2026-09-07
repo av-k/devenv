@@ -1,0 +1,22 @@
+# Local overrides — never commit
+.env.local
+
+# Credentials and agent state
+*.key
+*.pem
+.claude/
+.codex/
+.gemini/
+
+# Local notes
+docs/
+agent-notes/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.bak
+*~
+.DS_Store
+Thumbs.db

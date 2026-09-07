@@ -1,0 +1,55 @@
+# Hosts the sandbox may reach. One per line; '#' starts a comment.
+# Literal IPv4 addresses and CIDR blocks are accepted as well.
+#
+# Edit and restart the container to apply. No rebuild required.
+# Denied attempts are logged with the prefix "devenv-deny:".
+#
+# This list applies to IPv4. Outbound IPv6 is closed entirely and is not
+# configurable here; denied IPv6 attempts are logged as "devenv-deny6:".
+
+# --- Claude Code ---
+api.anthropic.com
+claude.ai
+console.anthropic.com
+downloads.claude.ai
+code.claude.com
+docs.claude.com
+
+# --- Codex CLI ---
+chatgpt.com
+api.openai.com
+auth.openai.com
+releases.openai.com
+
+# --- Antigravity CLI ---
+antigravity.google
+accounts.google.com
+oauth2.googleapis.com
+generativelanguage.googleapis.com
+cloudcode-pa.googleapis.com
+
+# --- Git hosting ---
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+ghcr.io
+pkg-containers.githubusercontent.com
+
+# --- Package registries ---
+registry.npmjs.org
+registry.yarnpkg.com
+pypi.org
+files.pythonhosted.org
+proxy.golang.org
+sum.golang.org
+crates.io
+static.crates.io
+
+# --- Distribution packages ---
+deb.debian.org
+security.debian.org
+archive.ubuntu.com
+
+# --- Add your own below ---

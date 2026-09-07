@@ -1,0 +1,10 @@
+# The Dockerfile copies three scripts and nothing else. Excluding everything
+# and allowing those back is deliberate: a blacklist would need updating every
+# time a file appears next to the launcher, and the one file that must never
+# reach the daemon - .env.local - would be one forgotten line away from being
+# sent. Denying by default also keeps .git out of the build context.
+*
+
+!entrypoint.sh
+!init-firewall.sh
+!agent-identity.sh

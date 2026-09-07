@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Launches a coding agent inside the sandbox, scoped to the current directory.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "${REPO_DIR}/.env.local" ] && . "${REPO_DIR}/.env.local"
+
+IMAGE="${DEVENV_IMAGE:-devenv:local}"
+ALLOWLIST="${DEVENV_ALLOWLIST_FILE:-${REPO_DIR}/allowlist.txt}"
+FIREWALL="on"
+
+usage() {
+    cat <<'EOF'
+Usage: devenv [options] [command ...]
+
+Runs a command inside the sandbox with the current directory mounted at /app.
+With no command, opens a shell. Agents available inside: claude, codex, agy.
+
+Options:
+  --build        Build the image, then exit.
+  --update       Rebuild without cache to pick up newer agent versions, then exit.
+  --open         Start without the egress filter. Use deliberately.
+  --versions     Print the tool versions baked into the image, then exit.
+  -h, --help     Show this help.
+
+Anything after '--' is passed to the container untouched.
+
+Examples:
+  devenv                     # shell in the sandbox
+  devenv claude              # Claude Code, scoped to this directory
+  devenv --open codex        # Codex with unrestricted network
+EOF
+}
+
+build() {
+    local extra=("$@")
+    echo "devenv: building ${IMAGE}"
+    docker build "${extra[@]}" -t "${IMAGE}" "${REPO_DIR}"
+    echo "devenv: done"
+    docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --build)    build; exit 0 ;;
+        --update)   build --no-cache --pull; exit 0 ;;
+        --open)     FIREWALL="off"; shift ;;
+        --versions) docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
+        -h|--help)  usage; exit 0 ;;
+        --)         shift; break ;;
+        -*)         echo "devenv: unknown option '$1'" >&2; usage >&2; exit 1 ;;
+        *)          break ;;
+    esac
+done
+
+if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    echo "devenv: image ${IMAGE} not found. Run 'devenv --build' first." >&2
+    exit 1
+fi
+
+if [ ! -r "${ALLOWLIST}" ]; then
+    echo "devenv: allowlist not readable at ${ALLOWLIST}" >&2
+    exit 1
+fi
+
+WORKDIR="$(pwd)"
+LABEL="devenv=${WORKDIR}"
+
+# One session per directory. Two agents sharing a working tree corrupt each
+# other's edits.
+if [ -n "$(docker ps -q --filter "label=${LABEL}")" ]; then
+    echo "devenv: a session is already running for ${WORKDIR}" >&2
+    echo "devenv: use a separate git worktree for a second agent." >&2
+    exit 1
+fi
+
+CAPS=()
+if [ "${FIREWALL}" = "on" ]; then
+    CAPS=(--cap-add=NET_ADMIN --cap-add=NET_RAW)
+else
+    echo "devenv: starting WITHOUT the egress filter" >&2
+fi
+
+# Converts a docker size (8g, 512m, 1024) to bytes. Fails on anything docker
+# would not accept, so the launcher can name the variable at fault instead of
+# leaving docker to answer "see usage".
+to_bytes() {
+    local value number unit
+    value="$(printf '%s' "${1}" | tr 'A-Z' 'a-z')"
+    [[ "${value}" =~ ^([0-9]+)(b|k|m|g|kb|mb|gb)?$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]:-}"
+    case "${unit}" in
+        ''|b)  echo "${number}" ;;
+        k|kb)  echo $(( number * 1024 )) ;;
+        m|mb)  echo $(( number * 1024 * 1024 )) ;;
+        g|gb)  echo $(( number * 1024 * 1024 * 1024 )) ;;
+    esac
+}
+
+# Resource limits. Unset means unlimited, which is the default: an empty value
+# must not reach docker, which rejects '--cpus=' outright.
+LIMITS=()
+[ -n "${DEVENV_CPUS:-}" ] && LIMITS+=(--cpus="${DEVENV_CPUS}")
+[ -n "${DEVENV_PIDS:-}" ] && LIMITS+=(--pids-limit="${DEVENV_PIDS}")
+
+if [ -n "${DEVENV_MEMORY_SWAP:-}" ] && [ -z "${DEVENV_MEMORY:-}" ]; then
+    echo "devenv: DEVENV_MEMORY_SWAP is set but DEVENV_MEMORY is not." >&2
+    echo "devenv: docker's swap limit is the total of memory plus swap, so it" >&2
+    echo "devenv: means nothing without a memory limit to be the total of." >&2
+    exit 1
+fi
+
+if [ -n "${DEVENV_MEMORY:-}" ]; then
+    if ! MEMORY_BYTES="$(to_bytes "${DEVENV_MEMORY}")"; then
+        echo "devenv: DEVENV_MEMORY='${DEVENV_MEMORY}' is not a size docker accepts." >&2
+        echo "devenv: use a whole number with an optional unit: 8g, 512m, 1024." >&2
+        exit 1
+    fi
+
+    # Swap defaults to the memory limit, which switches swap off. Docker's own
+    # default is to allow the same amount again as swap, so DEVENV_MEMORY=8g
+    # would mean 8 GiB of RAM plus 8 GiB of disk - a ceiling that hides
+    # thrashing rather than preventing it.
+    MEMORY_SWAP="${DEVENV_MEMORY_SWAP:-${DEVENV_MEMORY}}"
+
+    if [ "${MEMORY_SWAP}" != "-1" ]; then
+        if ! SWAP_BYTES="$(to_bytes "${MEMORY_SWAP}")"; then
+            echo "devenv: DEVENV_MEMORY_SWAP='${MEMORY_SWAP}' is not a size docker accepts." >&2
+            echo "devenv: use a whole number with an optional unit (8g, 512m, 1024)," >&2
+            echo "devenv: or -1 for unlimited swap." >&2
+            exit 1
+        fi
+        if [ "${SWAP_BYTES}" -lt "${MEMORY_BYTES}" ]; then
+            echo "devenv: DEVENV_MEMORY_SWAP (${MEMORY_SWAP}) is below DEVENV_MEMORY (${DEVENV_MEMORY})." >&2
+            echo "devenv: the swap limit is the total of memory plus swap, so it can" >&2
+            echo "devenv: never be the smaller of the two. Set it equal to" >&2
+            echo "devenv: DEVENV_MEMORY for no swap at all, higher to allow that" >&2
+            echo "devenv: much in total, or -1 for unlimited." >&2
+            exit 1
+        fi
+    fi
+
+    LIMITS+=(--memory="${DEVENV_MEMORY}" --memory-swap="${MEMORY_SWAP}")
+fi
+
+[ ${#LIMITS[@]} -gt 0 ] && echo "devenv: limits: ${LIMITS[*]}" >&2
+
+# SELinux hosts need a relabel option on bind mounts or the container cannot
+# read the project directory. Empty by default, which leaves the mount strings
+# byte-for-byte as they were.
+MOUNT_SUFFIX="${DEVENV_MOUNT_SUFFIX:-}"
+if [ -n "${MOUNT_SUFFIX}" ] && [ "${MOUNT_SUFFIX#:}" = "${MOUNT_SUFFIX}" ]; then
+    echo "devenv: DEVENV_MOUNT_SUFFIX must start with a colon, e.g. ':z'." >&2
+    echo "devenv: without one the value would be glued onto the mount path." >&2
+    exit 1
+fi
+
+# The allowlist mount already carries an option, and docker separates those
+# with commas rather than colons: ':ro,z', not ':ro:z'.
+ALLOWLIST_OPTS=":ro${MOUNT_SUFFIX:+,${MOUNT_SUFFIX#:}}"
+
+exec docker run --rm -it --init \
+    --label "${LABEL}" \
+    --hostname devenv \
+    -v "${WORKDIR}:/app${MOUNT_SUFFIX}" \
+    -v devenv-claude:/home/node/.claude \
+    -v devenv-codex:/home/node/.codex \
+    -v devenv-gemini:/home/node/.gemini \
+    -v "${ALLOWLIST}:/etc/devenv/allowlist.txt${ALLOWLIST_OPTS}" \
+    -e "DEVENV_FIREWALL=${FIREWALL}" \
+    -e "DEVENV_AGENT=${DEVENV_AGENT:-}" \
+    -e "TERM=${TERM:-xterm-256color}" \
+    "${CAPS[@]}" \
+    "${LIMITS[@]}" \
+    "${IMAGE}" \
+    "${@:-bash}"
