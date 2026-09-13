@@ -51,10 +51,21 @@ chmod +x devenv entrypoint.sh init-firewall.sh
 ./devenv --build
 ```
 
-Optionally put the launcher on your `PATH`:
+Optionally put the launcher on your `PATH`. The symlink is followed back to the
+clone, so `allowlist.txt`, `.env.local` and the `Dockerfile` are still found
+there, and the directory you launch from stays whatever you happen to be in:
 
 ```bash
 ln -s "$PWD/devenv" ~/.local/bin/devenv
+```
+
+To keep the allowlist somewhere else — shared between checkouts, or under your
+own config directory — name it explicitly. Everything else still comes from the
+clone:
+
+```bash
+# in .env.local next to the launcher, or exported in your shell
+DEVENV_ALLOWLIST_FILE=$HOME/.config/devenv/allowlist.txt
 ```
 
 ---

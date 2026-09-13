@@ -2,7 +2,36 @@
 # Launches a coding agent inside the sandbox, scoped to the current directory.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where the launcher's own files live. This is deliberately not
+# `dirname "${BASH_SOURCE[0]}"`: the documented install puts a symlink on PATH,
+# and the symlink's directory holds neither allowlist.txt, nor .env.local, nor
+# the Dockerfile that `--build` uses as its context.
+#
+# Resolved by hand rather than with `readlink -f` or `realpath`. Both are GNU
+# coreutils; BSD readlink has historically had no -f at all, and macOS only
+# gained compatible versions in 12.3. A fallback pair would mean two code paths
+# where the rare one rots unnoticed. This loop needs only `readlink` with no
+# options, which is POSIX, and it follows chains of symlinks and relative
+# targets alike.
+resolve_dir() {
+    local src="$1" dir hops=0
+    while [ -L "${src}" ]; do
+        hops=$((hops + 1))
+        if [ "${hops}" -gt 40 ]; then
+            echo "devenv: symlink loop while resolving ${1}" >&2
+            exit 1
+        fi
+        dir="$(cd -P "$(dirname "${src}")" && pwd)"
+        src="$(readlink "${src}")"
+        case "${src}" in
+            /*) ;;                      # absolute target, take as given
+            *)  src="${dir}/${src}" ;;  # relative to the link's own directory
+        esac
+    done
+    cd -P "$(dirname "${src}")" && pwd
+}
+
+REPO_DIR="$(resolve_dir "${BASH_SOURCE[0]}")"
 [ -f "${REPO_DIR}/.env.local" ] && . "${REPO_DIR}/.env.local"
 
 IMAGE="${DEVENV_IMAGE:-devenv:local}"
