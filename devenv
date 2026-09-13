@@ -54,6 +54,7 @@ fi
 IMAGE="${DEVENV_IMAGE:-devenv:local}"
 ALLOWLIST="${DEVENV_ALLOWLIST_FILE:-${REPO_DIR}/allowlist.txt}"
 FIREWALL="on"
+NESTED="off"
 
 usage() {
     cat <<'EOF'
@@ -66,6 +67,10 @@ Options:
   --build        Build the image, then exit.
   --update       Rebuild without cache to pick up newer agent versions, then exit.
   --open         Start without the egress filter. Use deliberately.
+  --nested-sandbox
+                 Allow user namespaces, so an agent's own sandbox can run.
+                 Turns off the seccomp filter for the session; read the
+                 README before using it.
   --versions     Print the tool versions baked into the image, then exit.
   -h, --help     Show this help.
 
@@ -126,6 +131,7 @@ while [[ $# -gt 0 ]]; do
         --build)    build; exit 0 ;;
         --update)   build --no-cache --pull; exit 0 ;;
         --open)     FIREWALL="off"; shift ;;
+        --nested-sandbox) NESTED="on"; shift ;;
         --versions) require_docker; require_image
                     docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
         -h|--help)  usage; exit 0 ;;
@@ -200,6 +206,21 @@ if [ "${FIREWALL}" = "on" ]; then
     CAPS=(--cap-add=NET_ADMIN --cap-add=NET_RAW)
 else
     echo "devenv: starting WITHOUT the egress filter" >&2
+fi
+
+# An agent that sandboxes its own shell commands needs user namespaces, which
+# docker's default seccomp profile denies. Turning the profile off is the price,
+# and it is charged per session on purpose: there is no environment variable for
+# this, so it cannot be set once in .env.local and forgotten.
+#
+# seccomp rather than --cap-add=SYS_ADMIN, which also works: the session's
+# process is unprivileged and holds no capabilities, so dropping the syscall
+# filter widens the kernel surface it can reach, whereas SYS_ADMIN would hand
+# the container a capability that is itself a way out of it.
+SECCOMP=()
+if [ "${NESTED}" = "on" ]; then
+    SECCOMP=(--security-opt seccomp=unconfined)
+    echo "devenv: user namespaces enabled; the seccomp filter is OFF this session" >&2
 fi
 
 # Converts a docker size (8g, 512m, 1024) to bytes. Fails on anything docker
@@ -291,6 +312,7 @@ exec docker run --rm -it --init \
     -e "DEVENV_AGENT=${DEVENV_AGENT:-}" \
     -e "TERM=${TERM:-xterm-256color}" \
     "${CAPS[@]}" \
+    "${SECCOMP[@]}" \
     "${LIMITS[@]}" \
     "${IMAGE}" \
     "${@:-bash}"

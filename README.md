@@ -98,6 +98,7 @@ you are in.
 | `--build` | Build the image and exit |
 | `--update` | Rebuild without cache to pick up newer agent versions, then exit |
 | `--open` | Start without the egress filter |
+| `--nested-sandbox` | Allow user namespaces, so an agent's own sandbox can run — see [An agent's own sandbox](#an-agents-own-sandbox) |
 | `--versions` | Print the tool versions baked into the image |
 
 Anything after `--` is passed through untouched:
@@ -288,6 +289,55 @@ credentials out of the container, and review diffs before merging.
 
 Use `--open` when you are fighting a dependency and need the filter out of the
 way. It prints a warning; that is deliberate.
+
+---
+
+## An agent's own sandbox
+
+Codex sandboxes the shell commands it runs, with bubblewrap and user
+namespaces. Neither works in here by default: docker's seccomp profile denies
+unprivileged user namespaces, so every command Codex attempts fails with
+
+```
+bwrap: No permissions to create a new namespace
+```
+
+after which Codex asks you to approve the command and runs it with no sandbox
+at all. Nothing is broken — commands do run — but the `Workspace (Ask for
+approval)` in its header only delivers the second half, and you approve every
+command by hand.
+
+Installing the `bubblewrap` package does not help. Debian's binary is not
+setuid and fails identically; what blocks it is the seccomp profile, not the
+missing package.
+
+`--nested-sandbox` lifts that:
+
+```bash
+devenv --nested-sandbox codex
+```
+
+Measured with it on: user namespaces work, `codex sandbox` runs commands
+instead of failing, writes outside the workspace are refused, and network from
+a sandboxed command is blocked. The egress filter is unaffected — the allowlist
+still applies to the session as a whole. Whether it also stops the per-command
+approval prompts is Codex's own policy rather than something this flag decides.
+
+**What it costs.** The session runs with docker's seccomp filter off, widening
+the set of syscalls reachable from inside the container. The session's process
+is unprivileged and holds no capabilities, which limits what that is worth to
+an attacker, but the reduction is real. It is a per-session flag with no
+environment variable behind it on purpose: this should not be something set
+once in `.env.local` and forgotten. `--cap-add=SYS_ADMIN` would work too, and
+is worse — a capability that is itself a way out of a container.
+
+**What it does not fix.** Codex's sandbox restricts writes and network, not
+reads: a sandboxed command can still read anything in the container, mounted
+credential volumes included. That is why only the launched agent's volume is
+mounted at all.
+
+Claude Code and Antigravity CLI do not sandbox their own commands, so the flag
+changes nothing for them.
 
 ---
 
@@ -575,6 +625,9 @@ account on most Linux installs, and the default on WSL2.
 - **A session always runs as uid 1000**, and `DEVENV_UID` does not yet make it
   otherwise. If your account is not uid 1000, see [Portability](#portability).
 - **Podman is untested.** See [Portability](#portability).
+- **An agent's own sandbox does not run without `--nested-sandbox`**, because
+  docker's seccomp profile denies user namespaces. See
+  [An agent's own sandbox](#an-agents-own-sandbox).
 - **Antigravity version cannot be pinned** (see above).
 - **A CPU limit does not change what `nproc` reports**, so a project that
   parallelises from it will over-subscribe a limited session. See
