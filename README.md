@@ -86,6 +86,13 @@ First run of each agent prompts for login. Credentials are stored in Docker
 named volumes (`devenv-claude`, `devenv-codex`, `devenv-gemini`), so the login
 survives container recreation and never touches your project directory.
 
+**Only the named agent's volume is mounted.** `devenv codex` sees
+`devenv-codex` and neither of the others, so one agent cannot read another's
+token. Starting without naming an agent — a plain shell, or any other command —
+mounts all three, because an agent started from that shell would otherwise walk
+into a login whose result dies with the container. The launcher says which case
+you are in.
+
 | Flag | Effect |
 | --- | --- |
 | `--build` | Build the image and exit |

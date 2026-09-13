@@ -177,6 +177,24 @@ if [ -n "$(docker ps -q --filter "label=${LABEL}")" ]; then
     exit 1
 fi
 
+# Credential volumes, one per agent. Mounting all three into every session lets
+# any agent read the others' tokens, so the volume follows the agent being
+# launched. The command decides, not DEVENV_AGENT: that is an identity label,
+# and keeping the two apart means `DEVENV_AGENT=claude-review devenv claude`
+# still gets Claude's volume and nobody has to think about it.
+CREDS=()
+case "${1:-}" in
+    claude) CREDS=(-v devenv-claude:/home/node/.claude) ;;
+    codex)  CREDS=(-v devenv-codex:/home/node/.codex) ;;
+    agy)    CREDS=(-v devenv-gemini:/home/node/.gemini) ;;
+    *)      CREDS=(-v devenv-claude:/home/node/.claude \
+                   -v devenv-codex:/home/node/.codex \
+                   -v devenv-gemini:/home/node/.gemini)
+            echo "devenv: no agent named, so all three credential volumes are mounted." >&2
+            echo "devenv: name one - 'devenv claude', 'devenv codex', 'devenv agy' - to" >&2
+            echo "devenv: mount only its own." >&2 ;;
+esac
+
 CAPS=()
 if [ "${FIREWALL}" = "on" ]; then
     CAPS=(--cap-add=NET_ADMIN --cap-add=NET_RAW)
@@ -267,9 +285,7 @@ exec docker run --rm -it --init \
     --label "${LABEL}" \
     --hostname devenv \
     -v "${WORKDIR}:/app${MOUNT_SUFFIX}" \
-    -v devenv-claude:/home/node/.claude \
-    -v devenv-codex:/home/node/.codex \
-    -v devenv-gemini:/home/node/.gemini \
+    "${CREDS[@]}" \
     -v "${ALLOWLIST}:/etc/devenv/allowlist.txt${ALLOWLIST_OPTS}" \
     -e "DEVENV_FIREWALL=${FIREWALL}" \
     -e "DEVENV_AGENT=${DEVENV_AGENT:-}" \
