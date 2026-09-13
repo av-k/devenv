@@ -624,6 +624,11 @@ account on most Linux installs, and the default on WSL2.
   [Portability](#portability).
 - **A session always runs as uid 1000**, and `DEVENV_UID` does not yet make it
   otherwise. If your account is not uid 1000, see [Portability](#portability).
+- **`docker exec` into a running session lands as root.** Privileges are
+  dropped by the entrypoint, which `docker exec` bypasses, and the image
+  carries no `USER` directive because the entrypoint has to start as root to
+  apply the egress filter. Use `docker exec -u node <container> bash`, or files
+  you create land in your project owned by root.
 - **Podman is untested.** See [Portability](#portability).
 - **An agent's own sandbox does not run without `--nested-sandbox`**, because
   docker's seccomp profile denies user namespaces. See
