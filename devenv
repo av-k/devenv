@@ -32,7 +32,24 @@ resolve_dir() {
 }
 
 REPO_DIR="$(resolve_dir "${BASH_SOURCE[0]}")"
-[ -f "${REPO_DIR}/.env.local" ] && . "${REPO_DIR}/.env.local"
+
+# Local settings. Anything wrong with this file is reported rather than
+# skipped: silently running without the settings someone wrote down is how a
+# misconfiguration turns into a mystery.
+ENV_LOCAL="${REPO_DIR}/.env.local"
+if [ -e "${ENV_LOCAL}" ]; then
+    if [ ! -f "${ENV_LOCAL}" ]; then
+        echo "devenv: ${ENV_LOCAL} is not a regular file." >&2
+        exit 1
+    elif [ ! -r "${ENV_LOCAL}" ]; then
+        echo "devenv: ${ENV_LOCAL} is not readable; its settings would be" >&2
+        echo "devenv: silently ignored. Check its permissions." >&2
+        exit 1
+    elif ! . "${ENV_LOCAL}"; then
+        echo "devenv: ${ENV_LOCAL} could not be read; see the error above." >&2
+        exit 1
+    fi
+fi
 
 IMAGE="${DEVENV_IMAGE:-devenv:local}"
 ALLOWLIST="${DEVENV_ALLOWLIST_FILE:-${REPO_DIR}/allowlist.txt}"
@@ -61,8 +78,43 @@ Examples:
 EOF
 }
 
+# Everything below needs a working daemon. Checked separately from the image so
+# an unreachable daemon is not reported as a missing image: that answer sends
+# people off to run --build, which cannot work either, and hides the real
+# cause - a stopped daemon, or an account that is not in the docker group.
+require_docker() {
+    local err
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "devenv: docker is not on PATH." >&2
+        exit 1
+    fi
+    if ! err="$(docker version --format '{{.Server.Version}}' 2>&1 >/dev/null)"; then
+        echo "devenv: cannot reach the docker daemon. It reports:" >&2
+        printf '  %s\n' "${err}" >&2
+        exit 1
+    fi
+}
+
+# Checked before any `docker run`, so a missing image is named as such instead
+# of docker trying to pull devenv:local from a registry and answering with
+# "pull access denied ... may require 'docker login'".
+require_image() {
+    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+        echo "devenv: image ${IMAGE} not found. Run 'devenv --build' first." >&2
+        exit 1
+    fi
+}
+
 build() {
     local extra=("$@")
+    require_docker
+    if [ ! -f "${REPO_DIR}/Dockerfile" ]; then
+        echo "devenv: no Dockerfile in ${REPO_DIR}" >&2
+        echo "devenv: the image is built from the launcher's own directory, so" >&2
+        echo "devenv: it looks like the script was copied out of the clone on" >&2
+        echo "devenv: its own. Symlink it instead of copying it." >&2
+        exit 1
+    fi
     echo "devenv: building ${IMAGE}"
     docker build "${extra[@]}" -t "${IMAGE}" "${REPO_DIR}"
     echo "devenv: done"
@@ -74,7 +126,8 @@ while [[ $# -gt 0 ]]; do
         --build)    build; exit 0 ;;
         --update)   build --no-cache --pull; exit 0 ;;
         --open)     FIREWALL="off"; shift ;;
-        --versions) docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
+        --versions) require_docker; require_image
+                    docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
         -h|--help)  usage; exit 0 ;;
         --)         shift; break ;;
         -*)         echo "devenv: unknown option '$1'" >&2; usage >&2; exit 1 ;;
@@ -82,10 +135,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-    echo "devenv: image ${IMAGE} not found. Run 'devenv --build' first." >&2
-    exit 1
-fi
+require_docker
+require_image
 
 # The allowlist is bind-mounted as a file. Docker does not check what it is
 # being handed: pointed at a directory it mounts the directory, the filter then
