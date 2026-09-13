@@ -87,8 +87,31 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ ! -r "${ALLOWLIST}" ]; then
-    echo "devenv: allowlist not readable at ${ALLOWLIST}" >&2
+# The allowlist is bind-mounted as a file. Docker does not check what it is
+# being handed: pointed at a directory it mounts the directory, the filter then
+# reads nothing, and the container reports an empty allowlist - which sends the
+# search towards DNS and the file's contents rather than the mount. Each case
+# gets its own message here, before docker is involved.
+if [ -L "${ALLOWLIST}" ] && [ ! -e "${ALLOWLIST}" ]; then
+    echo "devenv: the allowlist at ${ALLOWLIST} is a broken symlink." >&2
+    echo "devenv: it points at $(readlink "${ALLOWLIST}"), which does not exist." >&2
+    exit 1
+elif [ ! -e "${ALLOWLIST}" ]; then
+    echo "devenv: no allowlist at ${ALLOWLIST}" >&2
+    echo "devenv: expected allowlist.txt beside the launcher, or" >&2
+    echo "devenv: DEVENV_ALLOWLIST_FILE pointing at one." >&2
+    exit 1
+elif [ -d "${ALLOWLIST}" ]; then
+    echo "devenv: the allowlist path ${ALLOWLIST} is a directory, not a file." >&2
+    echo "devenv: docker would mount it without complaint and the filter would" >&2
+    echo "devenv: come up empty. Point it at allowlist.txt itself." >&2
+    exit 1
+elif [ ! -f "${ALLOWLIST}" ]; then
+    echo "devenv: the allowlist at ${ALLOWLIST} is not a regular file." >&2
+    exit 1
+elif [ ! -r "${ALLOWLIST}" ]; then
+    echo "devenv: the allowlist at ${ALLOWLIST} is not readable." >&2
+    echo "devenv: check its permissions and those of the directories above it." >&2
     exit 1
 fi
 

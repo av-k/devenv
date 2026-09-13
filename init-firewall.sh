@@ -11,8 +11,22 @@ set -eu
 ALLOWLIST="${DEVENV_ALLOWLIST:-/etc/devenv/allowlist.txt}"
 SETNAME="devenv-allow"
 
-if [ ! -r "$ALLOWLIST" ]; then
-    echo "devenv: allowlist not found at $ALLOWLIST" >&2
+# What arrived at the mount point decides the message. A directory here means
+# the launcher was handed a directory as the mount source, and saying so beats
+# reporting an empty allowlist further down, which reads like a DNS problem.
+if [ -d "$ALLOWLIST" ]; then
+    echo "devenv: $ALLOWLIST is a directory, not a file." >&2
+    echo "devenv: the allowlist is bind-mounted as a file, so the mount source" >&2
+    echo "devenv: on the host was a directory. Nothing was read." >&2
+    exit 1
+elif [ ! -e "$ALLOWLIST" ]; then
+    echo "devenv: no allowlist at $ALLOWLIST" >&2
+    exit 1
+elif [ ! -f "$ALLOWLIST" ]; then
+    echo "devenv: $ALLOWLIST is not a regular file." >&2
+    exit 1
+elif [ ! -r "$ALLOWLIST" ]; then
+    echo "devenv: $ALLOWLIST is not readable." >&2
     exit 1
 fi
 
