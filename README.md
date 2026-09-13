@@ -401,27 +401,54 @@ running it elsewhere, including the parts that have not been tested.
 
 ### SELinux (Fedora, RHEL, and relatives)
 
-With SELinux enforcing, a bind mount without a relabel option is unreadable to
-the container: the host's labels stay on the files and the container process is
-denied. Docker's answer is the `:z` (shared) or `:Z` (private) mount option, so
-the launcher will take one:
+Whether you need anything here depends on the container engine, not on what
+`getenforce` says.
+
+**Docker CE, default configuration: nothing to do.** The daemon's
+`--selinux-enabled` is off unless you turn it on — verified against the daemon
+binary, whose help prints `(default true)` for options that are on by default
+and prints nothing for this one. With labelling off, containers get no SELinux
+type or MCS category of their own and bind mounts are not relabelled, so
+`DEVENV_MOUNT_SUFFIX` is unnecessary. Reported from a Fedora install running
+`Enforcing` with no `/etc/docker/daemon.json`: the sandbox built and ran, and
+`/app` was readable and writable. Check your own with:
+
+```bash
+getenforce                                         # Enforcing: SELinux is on
+docker info --format '{{json .SecurityOptions}}'   # a selinux entry: docker uses it
+```
+
+**Where the option is needed:** with `"selinux-enabled": true` in
+`daemon.json`, and on Podman, where labelling is on by default — upstream
+`containers.conf` ships `label = true`. There an unlabelled bind mount is
+unreadable to the container, and the launcher takes a relabel option:
 
 ```
 DEVENV_MOUNT_SUFFIX=:z
 ```
 
-It is appended to the project mount and folded into the allowlist mount, where
-docker separates options with commas rather than colons (`:ro,z`). It has to
-begin with a colon — without one the launcher stops instead of quietly
+`:z` labels the mount as shared, `:Z` as private to a single container. The
+value is appended to the project mount and folded into the allowlist mount,
+where docker separates options with commas rather than colons (`:ro,z`). It has
+to begin with a colon — without one the launcher stops instead of quietly
 mounting your project at `/appz`. Empty is the default, and leaves both mount
 strings byte-for-byte as they were.
 
-**This is not verified on an SELinux system.** What has been checked is that
-the launcher emits the intended mount strings, and that a container still
-starts and can read and write `/app` with the option set. Whether the
-relabelling then satisfies an enforcing policy is untested: this machine runs
-WSL2, which has no SELinux to test against. If it does not work on Fedora,
-treat it as a bug here rather than as something you have configured wrongly.
+**That path is still untested.** What has been checked is that the launcher
+emits the intended mount strings, and that a container starts and can read and
+write `/app` with the option set. Whether the relabelling then satisfies an
+enforcing policy with labelling switched on, nobody has exercised. If it does
+not work, treat it as a bug here rather than as something you configured
+wrongly.
+
+**Worth knowing if you came here for the security.** With labelling off —
+Docker's default — SELinux is not adding a layer on top of this sandbox. The
+boundary is the one this README describes: one bind mount, an unprivileged
+user, an egress filter. It is not being reinforced by the host's mandatory
+access control, whatever `getenforce` reports. Podman's default labelling would
+add that layer, at the cost of needing the option above. That is a fact about
+how Docker ships rather than about this tool, and it is an easy one to assume
+the other way.
 
 ### Podman
 
@@ -443,6 +470,8 @@ user namespace rather than of anything in here:
   namespace.** Whether `--cap-add=NET_ADMIN` is enough for that in a rootless
   netns depends on the network backend; rootful podman is the safer bet if the
   filter refuses to apply.
+- **SELinux labelling is on by default**, which is the opposite of Docker, so
+  bind mounts need `DEVENV_MOUNT_SUFFIX=:z` — see above.
 
 If you get it working, the launcher change is small — the engine name appears
 in one place.
@@ -505,7 +534,9 @@ account on most Linux installs, and the default on WSL2.
 - **A CPU limit does not change what `nproc` reports**, so a project that
   parallelises from it will over-subscribe a limited session. See
   [Resource limits](#resource-limits).
-- **SELinux relabelling is untested.** See [Portability](#portability).
+- **SELinux relabelling is untested**, and is only needed where the engine
+  labels containers at all — which Docker does not do by default, even with
+  SELinux enforcing. See [Portability](#portability).
 - **Browser-based login flows need a device-code path.** There is no browser in
   the container. All three agents support this; for Codex it must be enabled in
   your ChatGPT security settings first.
