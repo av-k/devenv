@@ -382,6 +382,7 @@ Base `node:24-slim`, running as user `node`, working directory `/app`.
 - `mongosh`
 - `git`, `curl`, `jq`, `zstd`
 - `iptables`, `ipset` for the egress filter
+- Python 3, with a virtualenv on `PATH` — see [Python](#python)
 - `LANG=C.UTF-8`, so text handling is not ASCII-only. Note what that does and
   does not buy: the encoding is UTF-8, but collation and case conversion stay
   C-locale, so `sort` orders by byte value and `tr '[:lower:]' '[:upper:]'`
@@ -391,6 +392,43 @@ Base `node:24-slim`, running as user `node`, working directory `/app`.
 
 The container starts as root only long enough to apply the filter, then
 `setpriv` drops to `node` for the session. There is no `sudo` in the image.
+
+---
+
+## Python
+
+`python3`, `python` and `pip` all resolve to a virtualenv at
+`/opt/devenv/venv`, which is on `PATH`. Installing a library takes no flags and
+no environment variables:
+
+```bash
+pip install requests
+```
+
+The indirection is there because a plain Debian `python3` is a dead end. pip is
+not installed alongside it (`No module named pip`), the interpreter is marked
+externally-managed so pip would refuse to write into it in any case, and the
+usual `pip install --user` escape lands in `~/.local`, which is read-only here
+to keep the agent versions pinned. None of that applies inside a virtualenv.
+
+The venv is writable — it has to be — but it sits *after* the agent
+directories in `PATH`, so a package that installs a console script named
+`claude` cannot shadow the real one.
+
+**Packages do not survive the session.** The venv itself is part of the image
+and is there at every start, but anything added to it lives in the container's
+writable layer and goes with `--rm`. That is the same bargain as everything
+else here: the project persists, the container does not. Dependencies that
+belong to the project belong in a virtualenv inside it, which persists and
+stays per-project:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
+
+`pypi.org` and `files.pythonhosted.org` are in `allowlist.txt` already, and
+they are enough: wheels and builds from source both work through the egress
+filter.
 
 ---
 

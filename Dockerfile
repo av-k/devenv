@@ -112,12 +112,43 @@ RUN chmod 0555 /opt/devenv/bin/agent-identity \
     && chown -R root:root /opt/devenv/bin \
     && chmod a-w /opt/devenv/bin
 
-ENV PATH=/opt/devenv/bin:${PATH}
-
 # git has no per-user config in this image and the home directory's owner
 # varies with DEVENV_UID, so the global config lives outside it. entrypoint.sh
 # regenerates the file on every start.
 ENV GIT_CONFIG_GLOBAL=/etc/devenv/gitconfig
+
+# ---------------------------------------------------------------------------
+# Python
+#
+# Agents reach for Python for throwaway scripts. An interpreter that cannot
+# install a library is worse than none at all - it sends them looking for a way
+# around - and on Debian that is what a bare python3 gives you: pip is not
+# installed (`No module named pip`), and the interpreter is marked
+# externally-managed, so pip would refuse anyway. The usual escape hatch,
+# `pip install --user`, writes to ~/.local, which is read-only here on purpose.
+#
+# A virtualenv avoids all of it: pip inside one is not externally-managed, and
+# `pip install` works with no flags and no environment variables.
+#
+# Installed in a layer of its own, after the agents, for the same reason the
+# locale is: an earlier layer would invalidate the agent installs, and the
+# Antigravity version cannot be pinned, so a rebuild could silently change it.
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# The venv is writable by the runtime user - it has to be, for pip to work.
+# /opt/devenv and /opt/devenv/bin around it stay root-owned and unwritable.
+RUN python3 -m venv /opt/devenv/venv \
+    && chown -R node:node /opt/devenv/venv
+
+# Precedence, and it matters. The agent wrappers and the pinned agent binaries
+# come first, so a package that installs a console script into the writable
+# venv cannot shadow them. The venv still precedes /usr/bin, so python3 and pip
+# are the venv's rather than the system's.
+ENV PATH=/opt/devenv/bin:/home/node/.local/bin:/opt/devenv/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 WORKDIR /app
 
