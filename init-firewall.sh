@@ -44,6 +44,20 @@ fi
 # hand-written docker run, another launcher. A value is checked by the code
 # that hands it to iptables.
 #
+# The address comes from /etc/hosts and nowhere else - not from DNS. The entry
+# there is what docker writes for --add-host=host.docker.internal:host-gateway,
+# the launcher's own flag, and it is the only answer that means "this host's
+# bridge". DNS answers for any name it is asked about: docker's resolver
+# forwards unknown names to the host's, and on Docker Desktop or WSL that
+# resolver knows host.docker.internal by itself - seen answering 127.0.0.1 for
+# a container started without --add-host. Whatever address DNS gives, the
+# ports would be opened to it, including one outside this machine.
+#
+# The address must also be private (RFC 1918). host-gateway is the address of
+# docker's bridge, which is always in one of those ranges; loopback, 0.0.0.0 or
+# a public address means the entry did not come from --add-host, or was
+# changed, and opening ports to it would open them somewhere nobody chose.
+#
 # All of it is checked and resolved before the first rule is touched, so a bad
 # value stops the container instead of leaving a half-built filter behind.
 # ---------------------------------------------------------------------------
@@ -55,6 +69,43 @@ bad_host_ports() {
     echo "devenv: DEVENV_HOST_PORTS='$DEVENV_HOST_PORTS': $1" >&2
     echo "devenv: expected ports from 1 to 65535, separated by spaces." >&2
     exit 1
+}
+
+# True for a dotted-quad IPv4 address in 10/8, 172.16/12 or 192.168/16. Strict
+# about the form as well: a leading zero makes an octet octal to inet_aton, so
+# 172.017.0.1 is not the address it looks like and is refused outright.
+is_private_ipv4() {
+    case "$1" in
+        *[!0-9.]*|.*|*.|*..*) return 1 ;;
+    esac
+    # Digits and dots only, so splitting on '.' does nothing but split.
+    old_ifs=$IFS
+    IFS=.
+    set -- $1
+    IFS=$old_ifs
+    [ $# -eq 4 ] || return 1
+    for octet in "$@"; do
+        case "$octet" in
+            0?*) return 1 ;;
+        esac
+        [ ${#octet} -le 3 ] && [ "$octet" -le 255 ] || return 1
+    done
+    case "$1" in
+        10)  return 0 ;;
+        172) [ "$2" -ge 16 ] && [ "$2" -le 31 ] ;;
+        192) [ "$2" -eq 168 ] ;;
+        *)   return 1 ;;
+    esac
+}
+
+# Every address /etc/hosts gives the name, one per line. IPv6 entries are left
+# out: the filter is IPv4, and IPv6 egress is closed wholesale further down.
+hosts_entries() {
+    awk -v name="$1" '
+        { sub(/#.*/, "") }
+        $1 ~ /:/ { next }
+        { for (i = 2; i <= NF; i++) if (tolower($i) == name) { print $1; next } }
+    ' /etc/hosts 2>/dev/null | sort -u
 }
 
 if [ -n "${DEVENV_HOST_PORTS:-}" ]; then
@@ -77,14 +128,28 @@ if [ -n "${DEVENV_HOST_PORTS:-}" ]; then
     done
     [ -n "$host_ports" ] || bad_host_ports "no ports in it."
 
-    host_addr=$(getent ahostsv4 "$HOST_NAME" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    host_addr=$(hosts_entries "$HOST_NAME")
     case "$host_addr" in
-        ''|*[!0-9.]*)
-            echo "devenv: $HOST_NAME does not resolve to an IPv4 address, so host" >&2
-            echo "devenv: ports $host_ports cannot be opened. The launcher adds it with" >&2
-            echo "devenv: --add-host; a container started otherwise needs the same." >&2
+        '')
+            echo "devenv: DEVENV_HOST_PORTS is set, but /etc/hosts has no IPv4 entry" >&2
+            echo "devenv: for $HOST_NAME. The launcher adds one with" >&2
+            echo "devenv: --add-host=$HOST_NAME:host-gateway, so this container was" >&2
+            echo "devenv: started some other way. No host ports are opened." >&2
+            exit 1 ;;
+        *"
+"*)
+            echo "devenv: /etc/hosts gives $HOST_NAME more than one address:" >&2
+            echo "devenv: $(printf '%s' "$host_addr" | tr '\n' ' '). One of them is not from --add-host, and" >&2
+            echo "devenv: there is no telling which. No host ports are opened." >&2
             exit 1 ;;
     esac
+    if ! is_private_ipv4 "$host_addr"; then
+        echo "devenv: /etc/hosts gives $HOST_NAME as '$host_addr', which is not a" >&2
+        echo "devenv: private (RFC 1918) IPv4 address. host-gateway is always one, so" >&2
+        echo "devenv: the entry did not come from --add-host or was changed." >&2
+        echo "devenv: No host ports are opened." >&2
+        exit 1
+    fi
 fi
 
 iptables -F OUTPUT
