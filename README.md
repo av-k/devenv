@@ -47,7 +47,6 @@ usage.
 ```bash
 git clone https://github.com/<you>/devenv.git
 cd devenv
-chmod +x devenv entrypoint.sh init-firewall.sh
 ./devenv --build
 ```
 
