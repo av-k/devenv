@@ -299,15 +299,16 @@ installer takes no version and only fetches the manifest's current build.
 ## The egress filter
 
 Domains in `allowlist.txt` are resolved when the container starts and pinned as
-addresses. Everything else is rejected. Denied attempts are logged with the
-prefix `devenv-deny:`.
+addresses. Everything else is rejected. Literal IPv4 addresses and CIDR blocks
+are accepted as they are.
 
 Editing the list needs no rebuild — change the file, restart the container.
 
 **What this is not.** It is a speed bump, not a wall:
 
 - Large CDNs rotate addresses. A long session may start seeing denials for
-  hosts that worked earlier. Restart to re-resolve.
+  hosts that worked earlier. Restart to re-resolve, or list the service's
+  published ranges — see [Known limitations](#known-limitations).
 - Anything reachable is a potential exfiltration channel, and development
   requires reaching a git host. An allowlist containing GitHub does not prevent
   a determined agent from pushing data to it.
@@ -317,6 +318,41 @@ credentials out of the container, and review diffs before merging.
 
 Use `--open` when you are fighting a dependency and need the filter out of the
 way. It prints a warning; that is deliberate.
+
+### Seeing what the filter rejected
+
+A rejected connection fails in the container with "connection refused". To see
+which rule it met, read the filter's counters from the host, in the project
+directory of the running session:
+
+```bash
+docker exec -u root "$(docker ps -q --filter "label=devenv=$PWD")" \
+    iptables -L OUTPUT -v -n --line-numbers
+```
+
+`pkts` counts the packets each rule matched. Repeat the failing request and see
+which line moves: the `REJECT` at the end means nothing let it through; the
+`match-set devenv-allow` line is the allowlist; `--host-port` adds one line per
+port. `ip6tables` in place of `iptables` shows the IPv6 side, and
+`ipset list devenv-allow` the addresses the allowlist resolved to at start —
+compare them with `getent ahostsv4 <host>` in the session when a host that
+used to work is refused.
+
+**The log is empty by default.** The filter also has a `LOG` rule, limited to
+10 entries a minute, with the prefix `devenv-deny:` (`devenv-deny6:` for
+IPv6), but `dmesg` and `journalctl -k` on the host show nothing from it. The
+rule fires in the container's network namespace, and the kernel discards
+netfilter log output from any namespace but the host's own unless told
+otherwise. If you want the log, switch that on — on the host, for every
+container's namespace at once:
+
+```bash
+sudo sysctl -w net.netfilter.nf_log_all_netns=1
+sudo journalctl -kf | grep devenv-deny
+```
+
+Set it back to `0` when done; it does not survive a reboot unless written to
+`/etc/sysctl.d`.
 
 ---
 
@@ -761,11 +797,7 @@ devenv --with playwright claude
 add-on image. For Claude Code, a `.mcp.json` in the project:
 
 ```json
-{
-  "mcpServers": {
-    "playwright": { "command": "playwright-mcp", "args": [] }
-  }
-}
+{"mcpServers": {"playwright": {"command": "playwright-mcp", "args": []}}}
 ```
 
 Other agents take the same command in their own MCP configuration. Started
@@ -969,6 +1001,15 @@ account on most Linux installs, and the default on WSL2.
 - **Browser-based login flows need a device-code path.** There is no browser in
   the container. All three agents support this; for Codex it must be enabled in
   your ChatGPT security settings first.
+- **The allowlist is resolved once, at container start.** A host whose
+  address changes during the session is refused from then on — seen in
+  practice with `github.com`, mid-session. Restarting re-resolves it. For a
+  service that publishes its address ranges, listing them as CIDR blocks in
+  `allowlist.txt` avoids it altogether; GitHub's are at
+  `https://api.github.com/meta`. Only list ranges the service itself owns: a
+  cloud provider's block holds other tenants too. See
+  [Seeing what the filter rejected](#seeing-what-the-filter-rejected) to tell
+  this apart from a host that was never allowed.
 - **`--host-port` opens TCP only, and only to services listening on the
   bridge.** A host service bound to `127.0.0.1` stays unreachable. See
   [Reaching services on the host](#reaching-services-on-the-host).
