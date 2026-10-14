@@ -58,6 +58,15 @@ NESTED="off"
 ADDONS=()
 ACTION=""
 
+# docker run options declared by the add-ons' run.conf; see read_run_conf.
+ADDON_RUN=()
+RUN_HOSTS=()
+SHM_SIZE=""
+SHM_BYTES=0
+SHM_FROM=""
+SHM_COUNT=0
+SHM_LIST=""
+
 # An add-on's name becomes both a path under addons/ and part of an image tag,
 # so it is held to a shape that is safe as either: no '/', no '.', nothing that
 # could walk out of addons/ or split the tag. Kept in a variable because a
@@ -246,6 +255,122 @@ check_addon_base() {
     echo "devenv: rebuild it with: devenv --build${WITH_FLAGS}" >&2
 }
 
+# Converts a docker size (8g, 512m, 1024) to bytes. Fails on anything docker
+# would not accept, so the launcher can name the variable at fault instead of
+# leaving docker to answer "see usage".
+to_bytes() {
+    local value number unit
+    value="$(printf '%s' "${1}" | tr 'A-Z' 'a-z')"
+    [[ "${value}" =~ ^([0-9]+)(b|k|m|g|kb|mb|gb)?$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]:-}"
+    case "${unit}" in
+        ''|b)  echo "${number}" ;;
+        k|kb)  echo $(( number * 1024 )) ;;
+        m|mb)  echo $(( number * 1024 * 1024 )) ;;
+        g|gb)  echo $(( number * 1024 * 1024 * 1024 )) ;;
+    esac
+}
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "${s}"
+}
+
+# What an add-on may ask of `docker run`, read from addons/<name>/run.conf.
+#
+# The file declares values for a closed set of keys, and the launcher writes
+# the flags itself. It is deliberately not a list of flags to pass through: any
+# pass-through, however filtered, is a way to --privileged, --cap-add, -v,
+# --security-opt or --network, each of which undoes part of the sandbox from a
+# file that looks like configuration. A key that is not known is an error
+# rather than skipped, so a typo or a wish for more is seen instead of quietly
+# not applying. New keys are added here one at a time, each with its own check.
+#
+# The file is read line by line as data - never sourced, evaluated or expanded
+# - and every value is matched against a pattern before it goes anywhere near
+# the command line.
+#
+#   shm_size=<size>                  --shm-size; the largest across add-ons wins
+#   add_host=<hostname>:host-gateway --add-host; repeatable, merged across
+#                                    add-ons. Only host-gateway, never an
+#                                    address: an arbitrary IP would let an
+#                                    add-on redirect a name the allowlist trusts.
+ADD_HOST_RE='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:host-gateway$'
+
+add_run_host() {
+    local host
+    if [ ${#RUN_HOSTS[@]} -gt 0 ]; then
+        for host in "${RUN_HOSTS[@]}"; do
+            [ "${host}" = "$1" ] && return 0
+        done
+    fi
+    RUN_HOSTS+=("$1")
+}
+
+run_conf_error() {
+    echo "devenv: add-on '$1', run.conf line $2: $3" >&2
+    echo "devenv: $4" >&2
+    exit 1
+}
+
+read_run_conf() {
+    local name="$1" file="${REPO_DIR}/addons/$1/run.conf"
+    local line text key value bytes n=0 have_shm="" adds=()
+    [ -e "${file}" ] || return 0
+    if [ ! -f "${file}" ] || [ ! -r "${file}" ]; then
+        echo "devenv: add-on '${name}': ${file} is not a readable regular file." >&2
+        exit 1
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+        n=$((n + 1))
+        text="$(trim "${line}")"
+        case "${text}" in
+            ''|'#'*) continue ;;
+            *=*)     ;;
+            *)       run_conf_error "${name}" "${n}" "${text}" \
+                         "expected key=value." ;;
+        esac
+        key="$(trim "${text%%=*}")"
+        value="$(trim "${text#*=}")"
+        case "${key}" in
+            shm_size)
+                if [ -n "${have_shm}" ]; then
+                    run_conf_error "${name}" "${n}" "${text}" \
+                        "shm_size is already set on line ${have_shm}."
+                fi
+                if ! bytes="$(to_bytes "${value}")"; then
+                    run_conf_error "${name}" "${n}" "${text}" \
+                        "shm_size takes a size: a whole number with an optional unit, e.g. 1g, 512m."
+                fi
+                have_shm="${n}"
+                adds+=(--shm-size="${value}")
+                SHM_COUNT=$((SHM_COUNT + 1))
+                SHM_LIST="${SHM_LIST:+${SHM_LIST}, }${value} from '${name}'"
+                if [ "${bytes}" -gt "${SHM_BYTES}" ]; then
+                    SHM_BYTES="${bytes}"
+                    SHM_SIZE="${value}"
+                    SHM_FROM="${name}"
+                fi ;;
+            add_host)
+                if [[ ! "${value}" =~ ${ADD_HOST_RE} ]]; then
+                    run_conf_error "${name}" "${n}" "${text}" \
+                        "add_host takes <hostname>:host-gateway, e.g. db.local:host-gateway; addresses are not accepted."
+                fi
+                adds+=(--add-host="${value}")
+                add_run_host "${value}" ;;
+            *)
+                run_conf_error "${name}" "${n}" "${text}" \
+                    "unknown key '${key}'; run.conf accepts shm_size and add_host only." ;;
+        esac
+    done < "${file}"
+    if [ ${#adds[@]} -gt 0 ]; then
+        echo "devenv: add-on '${name}' adds: ${adds[*]}" >&2
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build)    set_action build; shift ;;
@@ -346,6 +471,22 @@ fi
 if [ ${#ADDONS[@]} -gt 0 ]; then
     echo "devenv: add-ons this session: ${ADDONS[*]} (image ${SESSION_IMAGE})" >&2
     check_addon_base
+
+    for name in "${ADDONS[@]}"; do
+        read_run_conf "${name}"
+    done
+    if [ -n "${SHM_SIZE}" ]; then
+        if [ "${SHM_COUNT}" -gt 1 ]; then
+            echo "devenv: add-ons ask for different shm sizes (${SHM_LIST});" >&2
+            echo "devenv: using the largest, --shm-size=${SHM_SIZE} from add-on '${SHM_FROM}'." >&2
+        fi
+        ADDON_RUN+=(--shm-size="${SHM_SIZE}")
+    fi
+    if [ ${#RUN_HOSTS[@]} -gt 0 ]; then
+        for host in "${RUN_HOSTS[@]}"; do
+            ADDON_RUN+=(--add-host="${host}")
+        done
+    fi
 fi
 
 # Credential volumes, one per agent. Mounting all three into every session lets
@@ -387,23 +528,6 @@ if [ "${NESTED}" = "on" ]; then
     SECCOMP=(--security-opt seccomp=unconfined)
     echo "devenv: user namespaces enabled; the seccomp filter is OFF this session" >&2
 fi
-
-# Converts a docker size (8g, 512m, 1024) to bytes. Fails on anything docker
-# would not accept, so the launcher can name the variable at fault instead of
-# leaving docker to answer "see usage".
-to_bytes() {
-    local value number unit
-    value="$(printf '%s' "${1}" | tr 'A-Z' 'a-z')"
-    [[ "${value}" =~ ^([0-9]+)(b|k|m|g|kb|mb|gb)?$ ]] || return 1
-    number="${BASH_REMATCH[1]}"
-    unit="${BASH_REMATCH[2]:-}"
-    case "${unit}" in
-        ''|b)  echo "${number}" ;;
-        k|kb)  echo $(( number * 1024 )) ;;
-        m|mb)  echo $(( number * 1024 * 1024 )) ;;
-        g|gb)  echo $(( number * 1024 * 1024 * 1024 )) ;;
-    esac
-}
 
 # Resource limits. Unset means unlimited, which is the default: an empty value
 # must not reach docker, which rejects '--cpus=' outright.
@@ -479,5 +603,6 @@ exec docker run --rm -it --init \
     "${CAPS[@]}" \
     "${SECCOMP[@]}" \
     "${LIMITS[@]}" \
+    "${ADDON_RUN[@]}" \
     "${SESSION_IMAGE}" \
     "${@:-bash}"
