@@ -30,6 +30,63 @@ elif [ ! -r "$ALLOWLIST" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Host ports (devenv --host-port)
+#
+# Each port is opened to the host's gateway address alone, one rule per port.
+# Listing the gateway in the allowlist instead would put it in the ipset, and
+# the set matches addresses, not ports: every service on the host - sshd, a
+# database, a docker API on tcp - would be open to the session.
+#
+# The ports are checked again here although the launcher has checked them. This
+# script runs as root, before privileges are dropped, and its input is an
+# environment variable that anything starting the container can set - a
+# hand-written docker run, another launcher. A value is checked by the code
+# that hands it to iptables.
+#
+# All of it is checked and resolved before the first rule is touched, so a bad
+# value stops the container instead of leaving a half-built filter behind.
+# ---------------------------------------------------------------------------
+HOST_NAME="host.docker.internal"
+host_ports=""
+host_addr=""
+
+bad_host_ports() {
+    echo "devenv: DEVENV_HOST_PORTS='$DEVENV_HOST_PORTS': $1" >&2
+    echo "devenv: expected ports from 1 to 65535, separated by spaces." >&2
+    exit 1
+}
+
+if [ -n "${DEVENV_HOST_PORTS:-}" ]; then
+    # Digits and spaces only, so the unquoted expansion below can split into
+    # words and do nothing else - no globbing, no options.
+    case "$DEVENV_HOST_PORTS" in
+        *[!0-9\ ]*) bad_host_ports "holds something other than digits and spaces." ;;
+    esac
+    for port in $DEVENV_HOST_PORTS; do
+        case "$port" in
+            0*) bad_host_ports "'$port' has a leading zero or is zero." ;;
+        esac
+        if [ ${#port} -gt 5 ] || [ "$port" -gt 65535 ]; then
+            bad_host_ports "'$port' is above 65535."
+        fi
+        case " $host_ports " in
+            *" $port "*) ;;
+            *) host_ports="${host_ports:+$host_ports }$port" ;;
+        esac
+    done
+    [ -n "$host_ports" ] || bad_host_ports "no ports in it."
+
+    host_addr=$(getent ahostsv4 "$HOST_NAME" 2>/dev/null | awk 'NR == 1 { print $1 }')
+    case "$host_addr" in
+        ''|*[!0-9.]*)
+            echo "devenv: $HOST_NAME does not resolve to an IPv4 address, so host" >&2
+            echo "devenv: ports $host_ports cannot be opened. The launcher adds it with" >&2
+            echo "devenv: --add-host; a container started otherwise needs the same." >&2
+            exit 1 ;;
+    esac
+fi
+
 iptables -F OUTPUT
 ipset destroy "$SETNAME" 2>/dev/null || true
 ipset create "$SETNAME" hash:net
@@ -73,11 +130,17 @@ iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
 iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
 iptables -A OUTPUT -m set --match-set "$SETNAME" dst -j ACCEPT
+for port in $host_ports; do
+    iptables -A OUTPUT -d "$host_addr" -p tcp --dport "$port" -j ACCEPT
+done
 iptables -A OUTPUT -m limit --limit 10/min -j LOG --log-prefix "devenv-deny: "
 iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
 
 echo "devenv: egress filter active ($resolved entries allowed)"
 [ -n "$skipped" ] && echo "devenv: could not resolve:$skipped" >&2
+if [ -n "$host_ports" ]; then
+    echo "devenv: host access: $host_addr$(for port in $host_ports; do printf ' tcp/%s' "$port"; done)"
+fi
 
 # ---------------------------------------------------------------------------
 # IPv6

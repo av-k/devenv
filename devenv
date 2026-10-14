@@ -68,6 +68,12 @@ SHM_COUNT=0
 SHM_LIST=""
 RUN_NOTES=()
 
+# Host ports from --host-port. Digits only, no leading zero, so the value that
+# reaches iptables is the number the user meant and nothing else; the range is
+# checked separately.
+HOST_PORTS=()
+PORT_RE='^[1-9][0-9]{0,4}$'
+
 # An add-on's name becomes both a path under addons/ and part of an image tag,
 # so it is held to a shape that is safe as either: no '/', no '.', nothing that
 # could walk out of addons/ or split the tag. Kept in a variable because a
@@ -95,7 +101,10 @@ Options:
                  Turns off the seccomp filter for the session; read the
                  README before using it.
   --versions     Print the tool versions baked into the image, then exit.
-  --with NAME    Add the add-on in addons/NAME on top of the image, for this
+  --host-port PORT
+                 Let the session reach this TCP port on the host, as
+                 host.docker.internal. Repeatable; for this run only.
+  --with NAME   Add the add-on in addons/NAME on top of the image, for this
                  run only. Repeatable. With --build or --update, builds it.
   -h, --help     Show this help.
 
@@ -301,14 +310,38 @@ trim() {
 #                                    add-on redirect a name the allowlist trusts.
 ADD_HOST_RE='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:host-gateway$'
 
-add_run_host() {
+has_run_host() {
     local host
     if [ ${#RUN_HOSTS[@]} -gt 0 ]; then
         for host in "${RUN_HOSTS[@]}"; do
             [ "${host}" = "$1" ] && return 0
         done
     fi
-    RUN_HOSTS+=("$1")
+    return 1
+}
+
+add_run_host() {
+    has_run_host "$1" || RUN_HOSTS+=("$1")
+}
+
+add_host_port() {
+    local port="$1" seen
+    if [[ ! "${port}" =~ ${PORT_RE} ]] || [ "${port}" -gt 65535 ]; then
+        echo "devenv: '${port}' is not a valid port for --host-port." >&2
+        echo "devenv: use a number from 1 to 65535, without leading zeros." >&2
+        exit 1
+    fi
+    if [ ${#HOST_PORTS[@]} -gt 0 ]; then
+        for seen in "${HOST_PORTS[@]}"; do
+            [ "${seen}" = "${port}" ] && return 0
+        done
+    fi
+    HOST_PORTS+=("${port}")
+}
+
+missing_host_port() {
+    echo "devenv: --host-port needs a port number, e.g. '--host-port 3000'." >&2
+    exit 1
 }
 
 run_conf_error() {
@@ -385,6 +418,12 @@ while [[ $# -gt 0 ]]; do
                     add_addon "$2"; shift 2 ;;
         --with=*)   [ -n "${1#--with=}" ] || missing_addon_name
                     add_addon "${1#--with=}"; shift ;;
+        --host-port) if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
+                        missing_host_port
+                    fi
+                    add_host_port "$2"; shift 2 ;;
+        --host-port=*) [ -n "${1#--host-port=}" ] || missing_host_port
+                    add_host_port "${1#--host-port=}"; shift ;;
         -h|--help)  usage; exit 0 ;;
         --)         shift; break ;;
         -*)         echo "devenv: unknown option '$1'" >&2; usage >&2; exit 1 ;;
@@ -539,6 +578,28 @@ if [ "${NESTED}" = "on" ]; then
     echo "devenv: user namespaces enabled; the seccomp filter is OFF this session" >&2
 fi
 
+# Ports on the host the session may reach - a dev server, a database the
+# project talks to. Chosen per session like --nested-sandbox and for the same
+# reason: there is no environment variable for it, so a hole in the filter
+# cannot be set once in .env.local and forgotten. The launcher only names the
+# ports; init-firewall.sh opens each of them to the gateway address alone, and
+# checks them again itself.
+HOST_ACCESS=()
+if [ ${#HOST_PORTS[@]} -gt 0 ]; then
+    # An add-on may have declared the same name already; it is one host entry,
+    # so it goes on the command line once.
+    if ! has_run_host "host.docker.internal:host-gateway"; then
+        HOST_ACCESS+=(--add-host=host.docker.internal:host-gateway)
+    fi
+    HOST_ACCESS+=(-e "DEVENV_HOST_PORTS=${HOST_PORTS[*]}")
+    if [ "${FIREWALL}" = "on" ]; then
+        echo "devenv: host ports open this session: ${HOST_PORTS[*]} (host.docker.internal)" >&2
+    else
+        echo "devenv: --host-port with the egress filter off: every port on the host is" >&2
+        echo "devenv: reachable anyway. host.docker.internal is still added." >&2
+    fi
+fi
+
 # Resource limits. Unset means unlimited, which is the default: an empty value
 # must not reach docker, which rejects '--cpus=' outright.
 LIMITS=()
@@ -612,6 +673,7 @@ exec docker run --rm -it --init \
     -e "TERM=${TERM:-xterm-256color}" \
     "${CAPS[@]}" \
     "${SECCOMP[@]}" \
+    "${HOST_ACCESS[@]}" \
     "${LIMITS[@]}" \
     "${ADDON_RUN[@]}" \
     "${SESSION_IMAGE}" \
