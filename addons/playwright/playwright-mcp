@@ -19,13 +19,74 @@
 #                       the sandbox off for this browser on Linux; saying so here
 #                       keeps it from depending on that default.
 #
-# Anything else is passed on, so a project can add --output-dir,
-# --viewport-size and the like.
+# Anything else is passed on, so a project can add --viewport-size and the
+# like.
+#
+# Output goes to /tmp/playwright-mcp unless the project says otherwise. The
+# server's own default is .playwright-mcp under its working directory, which
+# here is /app - the project on the host. It writes a page snapshot and a
+# console log there on nearly every call, so they pile up in the working tree
+# and are one `git add -A` away from a commit. /tmp is in the container and goes
+# with it.
+#
+# A project that wants the files kept passes --output-dir itself, say
+# `--output-dir .playwright-mcp` for the old place, and adds that directory to
+# its .gitignore. PLAYWRIGHT_MCP_OUTPUT_DIR or outputDir in a --config file are
+# honoured the same way. They have to be looked for rather than overridden: the
+# server ranks a command-line flag above both, so a default passed
+# unconditionally would silently replace them. For a repeated --output-dir it
+# takes the last one, but two values on one command line are a trap for the
+# next person to read it, so the flag is detected and the default left out.
+#
+# Paths in the server's replies are relative to its working directory, so a
+# file here shows as ../tmp/playwright-mcp/page-<time>.yml - right from /app,
+# where the agent and the server start. A client that wants absolute paths can
+# pass --file-paths absolute.
 #
 # node and the server are called by absolute path. The virtualenv precedes
 # /usr/local/bin in PATH and is writable, so a package installed into it could
 # otherwise put its own node in front of this one.
 set -eu
 
-exec /usr/local/bin/node /usr/local/lib/node_modules/@playwright/mcp/cli.js \
-    --headless --browser chromium --isolated --no-sandbox "$@"
+NODE=/usr/local/bin/node
+SERVER=/usr/local/lib/node_modules/@playwright/mcp/cli.js
+DEFAULT_OUTPUT_DIR=/tmp/playwright-mcp
+
+# Whether a config file sets outputDir. The server reads JSON, or INI when the
+# file is not JSON; an unreadable file counts as not setting it, and the server
+# reports it when it tries to load it.
+config_sets_output_dir() {
+    "$NODE" -e '
+        const text = require("fs").readFileSync(process.argv[1], "utf8").replace(/^\uFEFF/, "");
+        let set;
+        try { set = JSON.parse(text).outputDir !== undefined; }
+        catch { set = /^\s*outputDir\s*=/m.test(text); }
+        process.exit(set ? 0 : 1);
+    ' "$1" 2>/dev/null
+}
+
+output_dir_chosen=""
+[ -n "${PLAYWRIGHT_MCP_OUTPUT_DIR:-}" ] && output_dir_chosen=1
+config="${PLAYWRIGHT_MCP_CONFIG:-}"
+config_next=""
+for arg in "$@"; do
+    if [ -n "$config_next" ]; then
+        config="$arg"
+        config_next=""
+        continue
+    fi
+    case "$arg" in
+        --output-dir|--output-dir=*) output_dir_chosen=1 ;;
+        --config)                    config_next=1 ;;
+        --config=*)                  config="${arg#--config=}" ;;
+    esac
+done
+if [ -z "$output_dir_chosen" ] && [ -n "$config" ] && config_sets_output_dir "$config"; then
+    output_dir_chosen=1
+fi
+
+if [ -z "$output_dir_chosen" ]; then
+    set -- --output-dir "$DEFAULT_OUTPUT_DIR" "$@"
+fi
+
+exec "$NODE" "$SERVER" --headless --browser chromium --isolated --no-sandbox "$@"
