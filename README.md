@@ -25,9 +25,9 @@ in bounds:
 - **Filesystem** — only the launch directory is mounted. Nothing else exists.
 - **Privileges** — no root, no sudo binary in the image.
 - **Network** — outbound traffic restricted to hosts you list.
-- **Versions** — pinned in the image, so a rebuild is the only thing that
-  changes what runs. Install directories are read-only, which also stops the
-  agents' own background self-updaters.
+- **Versions** — fixed in the image, so `devenv --update` is the only thing
+  that changes what runs. Install directories are read-only, which also stops
+  the agents' own background self-updaters.
 - **Disposable** — `--rm`. Nothing survives except the project and your login.
 
 ---
@@ -95,7 +95,7 @@ you are in.
 | Flag | Effect |
 | --- | --- |
 | `--build` | Build the image and exit |
-| `--update` | Rebuild without cache to pick up newer agent versions, then exit |
+| `--update` | Rebuild the agents at their latest versions, then exit |
 | `--open` | Start without the egress filter |
 | `--nested-sandbox` | Allow user namespaces, so an agent's own sandbox can run — see [An agent's own sandbox](#an-agents-own-sandbox) |
 | `--versions` | Print the tool versions baked into the image |
@@ -251,19 +251,36 @@ token inside; a push happens from the host, after you have read the diff.
 
 ## Updating agents
 
-Versions are build arguments. Edit the defaults in the Dockerfile or pass them
-in:
+Every agent installs its latest release when the image is built, and the image
+keeps that version until you ask for another:
 
 ```bash
-docker build --build-arg CLAUDE_CODE_VERSION=2.1.263 -t devenv:local .
+./devenv --update
 ```
 
-`./devenv --update` rebuilds from scratch and prints what landed in the image.
+It reinstalls the three agents and prints what landed in the image;
+`./devenv --versions` prints the same later, from
+`/opt/devenv/versions.txt`. The layers below the agents — Debian packages,
+mongosh — come from the build cache unless the base image has changed. To
+rebuild those as well, run `docker build --no-cache -t devenv:local .`.
 
-**Antigravity CLI cannot be pinned.** Its installer only fetches the manifest's
-latest build, so a rebuild may produce a different version than the last one.
-The resolved version is recorded at `/opt/devenv/versions.txt` inside the
-image; `./devenv --versions` prints it.
+`./devenv --build` does not move the versions. With "latest" as the version
+nothing in the Dockerfile changes between builds, so it keeps the agents of the
+image it replaces — as long as their layers are still in the build cache. Once
+they have been pruned, it installs whatever is latest at that moment.
+
+What this costs: builds are not reproducible. Two machines that last updated on
+different days run different versions, and a release with a regression reaches
+you as soon as you update. To hold an agent back, pin it with a build argument:
+
+```bash
+docker build --build-arg CLAUDE_CODE_VERSION=2.1.263 \
+             --build-arg CODEX_VERSION=0.153.4 -t devenv:local .
+```
+
+Claude Code also accepts `stable`, a release about a week old that skips
+releases with major regressions. **Antigravity CLI cannot be pinned**: its
+installer takes no version and only fetches the manifest's current build.
 
 ---
 
@@ -465,7 +482,7 @@ The indirection is there because a plain Debian `python3` is a dead end. pip is
 not installed alongside it (`No module named pip`), the interpreter is marked
 externally-managed so pip would refuse to write into it in any case, and the
 usual `pip install --user` escape lands in `~/.local`, which is read-only here
-to keep the agent versions pinned. None of that applies inside a virtualenv.
+to keep the agent versions fixed. None of that applies inside a virtualenv.
 
 The venv is writable — it has to be — but it sits *after* the agent
 directories in `PATH`, so a package that installs a console script named
@@ -632,7 +649,9 @@ account on most Linux installs, and the default on WSL2.
 - **An agent's own sandbox does not run without `--nested-sandbox`**, because
   docker's seccomp profile denies user namespaces. See
   [An agent's own sandbox](#an-agents-own-sandbox).
-- **Antigravity version cannot be pinned** (see above).
+- **Agent versions are whatever was latest at the last `--update`**, so builds
+  are not reproducible and Antigravity cannot be pinned at all. See
+  [Updating agents](#updating-agents).
 - **A CPU limit does not change what `nproc` reports**, so a project that
   parallelises from it will over-subscribe a limited session. See
   [Resource limits](#resource-limits).

@@ -6,11 +6,8 @@
 
 FROM node:24.20.0-slim
 
-# Pinned tool versions. Override at build time with --build-arg.
-# Antigravity CLI cannot be pinned: its installer only fetches the manifest's
-# latest build. The resolved version is recorded in /opt/devenv/versions.txt.
-ARG CLAUDE_CODE_VERSION=2.1.263
-ARG CODEX_VERSION=0.153.4
+# Pinned tool version. Override at build time with --build-arg. The agents'
+# versions are declared with the agents below.
 ARG MONGOSH_VERSION=2.10.0
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -49,6 +46,26 @@ USER node
 ENV HOME=/home/node
 ENV PATH=/home/node/.local/bin:${PATH}
 
+# Each agent installs its latest release at build time. Override with
+# --build-arg to pin one, e.g. CLAUDE_CODE_VERSION=2.1.263; Claude Code also
+# takes "stable", a week-old release that skips ones with major regressions.
+# Antigravity takes no version at all: its installer only fetches the
+# manifest's current build. What landed is recorded in /opt/devenv/versions.txt.
+#
+# With the version left at "latest" nothing here changes between builds, so the
+# cached layers would be reused indefinitely. AGENTS_REFRESH is what moves them:
+# `devenv --update` passes a fresh value, which misses the cache from this point
+# on and leaves the layers above it alone. `devenv --build` passes the value of
+# the image it replaces, read back from the label, so it reuses that image's
+# agent layers rather than whichever older ones are still in the cache.
+#
+# Declared here rather than at the top: a changed ARG invalidates every RUN
+# after its declaration, and at the top that would include apt-get.
+ARG AGENTS_REFRESH=
+ARG CLAUDE_CODE_VERSION=latest
+ARG CODEX_VERSION=latest
+LABEL devenv.agents-refresh="${AGENTS_REFRESH}"
+
 RUN curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION}"
 
 RUN export CODEX_HOME=/opt/codex \
@@ -64,8 +81,9 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 # ---------------------------------------------------------------------------
 USER root
 
-# Record what actually landed in the image. Antigravity is unpinnable, so this
-# file is the only record of which build a given image contains.
+# Record what actually landed in the image. The agents install whatever is
+# latest at build time, so this file is the only record of which builds a given
+# image contains.
 RUN { \
       echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
       echo "claude: $(su node -c 'claude --version' 2>/dev/null || echo unknown)"; \
@@ -90,9 +108,9 @@ ENV CODEX_HOME=/home/node/.codex
 # so this costs no package and no image size.
 #
 # Deliberately set here rather than before the installs: an earlier ENV would
-# invalidate every layer after it, and since the Antigravity version cannot be
-# pinned, a full rebuild can silently change which build is in the image. The
-# build steps themselves are ASCII either way.
+# invalidate every layer after it, and since the agents install their latest
+# release, rebuilding those layers silently changes which versions are in the
+# image. The build steps themselves are ASCII either way.
 ENV LANG=C.UTF-8
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -131,8 +149,8 @@ ENV GIT_CONFIG_GLOBAL=/etc/devenv/gitconfig
 # `pip install` works with no flags and no environment variables.
 #
 # Installed in a layer of its own, after the agents, for the same reason the
-# locale is: an earlier layer would invalidate the agent installs, and the
-# Antigravity version cannot be pinned, so a rebuild could silently change it.
+# locale is: an earlier layer would invalidate the agent installs, which would
+# then silently pick up whatever versions are latest.
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \

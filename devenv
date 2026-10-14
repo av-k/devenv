@@ -65,7 +65,7 @@ With no command, opens a shell. Agents available inside: claude, codex, agy.
 
 Options:
   --build        Build the image, then exit.
-  --update       Rebuild without cache to pick up newer agent versions, then exit.
+  --update       Rebuild the agents at their latest versions, then exit.
   --open         Start without the egress filter. Use deliberately.
   --nested-sandbox
                  Allow user namespaces, so an agent's own sandbox can run.
@@ -126,10 +126,26 @@ build() {
     docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt
 }
 
+# The AGENTS_REFRESH value the current image was built with, empty if there is
+# no image or it predates the label. Passing it back keeps a plain --build on
+# that image's agent layers; without it the build would match whichever cached
+# layers were built with the default, which after an --update are older ones.
+# A missing label prints "<no value>" rather than failing, hence the check.
+image_refresh() {
+    local value
+    value="$(docker image inspect \
+        --format '{{ index .Config.Labels "devenv.agents-refresh" }}' \
+        "${IMAGE}" 2>/dev/null)" || value=""
+    [ "${value}" = "<no value>" ] && value=""
+    printf '%s' "${value}"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --build)    build; exit 0 ;;
-        --update)   build --no-cache --pull; exit 0 ;;
+        --build)    build --build-arg "AGENTS_REFRESH=$(image_refresh)"; exit 0 ;;
+        --update)   build --pull \
+                        --build-arg "AGENTS_REFRESH=$(date -u +%Y%m%dT%H%M%SZ)"
+                    exit 0 ;;
         --open)     FIREWALL="off"; shift ;;
         --nested-sandbox) NESTED="on"; shift ;;
         --versions) require_docker; require_image
