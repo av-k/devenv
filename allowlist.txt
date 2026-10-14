@@ -2,10 +2,19 @@
 # Literal IPv4 addresses and CIDR blocks are accepted as well.
 #
 # Edit and restart the container to apply. No rebuild required.
-# Denied attempts are logged with the prefix "devenv-deny:".
 #
 # This list applies to IPv4. Outbound IPv6 is closed entirely and is not
-# configurable here; denied IPv6 attempts are logged as "devenv-deny6:".
+# configurable here.
+#
+# To see what was refused, read the filter's counters from the host, in the
+# project directory of the running session:
+#   docker exec -u root "$(docker ps -q --filter "label=devenv=$PWD")" \
+#       iptables -L OUTPUT -v -n --line-numbers
+# (ip6tables for IPv6). Denied attempts also hit a LOG rule with the prefix
+# "devenv-deny:" ("devenv-deny6:" for IPv6), but dmesg and journalctl show
+# nothing by default: the rule fires in the container's network namespace,
+# whose log the kernel discards unless net.netfilter.nf_log_all_netns=1.
+# See "Seeing what the filter rejected" in README.md.
 
 # --- Claude Code ---
 api.anthropic.com

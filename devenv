@@ -55,6 +55,35 @@ IMAGE="${DEVENV_IMAGE:-devenv:local}"
 ALLOWLIST="${DEVENV_ALLOWLIST_FILE:-${REPO_DIR}/allowlist.txt}"
 FIREWALL="on"
 NESTED="off"
+ADDONS=()
+ACTION=""
+
+# docker run options declared by the add-ons' run.conf; see read_run_conf.
+ADDON_RUN=()
+RUN_HOSTS=()
+SHM_SIZE=""
+SHM_BYTES=0
+SHM_FROM=""
+SHM_COUNT=0
+SHM_LIST=""
+RUN_NOTES=()
+
+# Host ports from --host-port. Digits only, no leading zero, so the value that
+# reaches iptables is the number the user meant and nothing else; the range is
+# checked separately.
+HOST_PORTS=()
+PORT_RE='^[1-9][0-9]{0,4}$'
+
+# An add-on's name becomes both a path under addons/ and part of an image tag,
+# so it is held to a shape that is safe as either: no '/', no '.', nothing that
+# could walk out of addons/ or split the tag. Kept in a variable because a
+# quoted pattern on the right of =~ is matched literally since bash 3.2.
+#
+# '_' is left out on purpose: it is the separator between names in the tag
+# (devenv:local_a_b), and only because no name can contain it does a tag map
+# back to exactly one set of add-ons. Allow '_' here and `--with a_b` collides
+# with `--with a --with b` again - both would build and run devenv:local_a_b.
+ADDON_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 
 usage() {
     cat <<'EOF'
@@ -72,14 +101,23 @@ Options:
                  Turns off the seccomp filter for the session; read the
                  README before using it.
   --versions     Print the tool versions baked into the image, then exit.
+  --host-port PORT
+                 Let the session reach this TCP port on the host, as
+                 host.docker.internal. Repeatable; for this run only.
+  --with NAME    Add the add-on in addons/NAME on top of the image, for this
+                 run only. Repeatable. With --build or --update, builds it.
   -h, --help     Show this help.
 
-Anything after '--' is passed to the container untouched.
+Options go before the command. Everything from the first word that is not an
+option is the command, so `devenv claude --host-port 3000` hands --host-port
+to Claude Code. Anything after '--' is passed to the container untouched.
 
 Examples:
   devenv                     # shell in the sandbox
   devenv claude              # Claude Code, scoped to this directory
   devenv --open codex        # Codex with unrestricted network
+  devenv --host-port 3000 claude
+                             # Claude Code, able to reach port 3000 on the host
 EOF
 }
 
@@ -104,14 +142,64 @@ require_docker() {
 # of docker trying to pull devenv:local from a registry and answering with
 # "pull access denied ... may require 'docker login'".
 require_image() {
-    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-        echo "devenv: image ${IMAGE} not found. Run 'devenv --build' first." >&2
+    if ! docker image inspect "${SESSION_IMAGE}" >/dev/null 2>&1; then
+        echo "devenv: image ${SESSION_IMAGE} not found. Run 'devenv --build${WITH_FLAGS}' first." >&2
         exit 1
     fi
 }
 
+add_addon() {
+    local name="$1"
+    if [[ ! "${name}" =~ ${ADDON_NAME_RE} ]]; then
+        echo "devenv: '${name}' is not a valid add-on name." >&2
+        echo "devenv: use lowercase letters, digits and '-', starting with a" >&2
+        echo "devenv: letter or digit." >&2
+        exit 1
+    fi
+    if [ ! -f "${REPO_DIR}/addons/${name}/Dockerfile" ]; then
+        echo "devenv: no add-on '${name}': expected ${REPO_DIR}/addons/${name}/Dockerfile" >&2
+        exit 1
+    fi
+    ADDONS+=("${name}")
+}
+
+missing_addon_name() {
+    echo "devenv: --with needs an add-on name, e.g. '--with playwright'." >&2
+    exit 1
+}
+
+# Actions run once every flag has been read, so `--build --with x` builds x as
+# well. Two of them would have the first silently win, so that is refused.
+set_action() {
+    if [ -n "${ACTION}" ] && [ "${ACTION}" != "$1" ]; then
+        echo "devenv: --${ACTION} and --$1 cannot be combined." >&2
+        exit 1
+    fi
+    ACTION="$1"
+}
+
+build_image() {
+    local tag="$1" context="$2"
+    shift 2
+    echo "devenv: building ${tag}"
+    docker build "$@" -t "${tag}" "${context}"
+}
+
+# Builds the base with the options given, then each add-on on top of the one
+# before it. The options are the base's alone: --pull in particular would send
+# an add-on looking for its FROM - a local image - in a registry, and fail.
+# An add-on needs no cache option of its own either: a rebuilt base has a new
+# ID, so its FROM changes and its layers miss the cache anyway.
+#
+# Each add-on's context is its own directory, so its build sees its own files
+# and nothing of the repository's, .env.local included.
+#
+# Every add-on image is labelled with the ID of the base it was built on. A
+# later --update without --with replaces the base and leaves the add-on images
+# where they were, still holding the old agents; the label is how a session
+# started with --with notices (see check_addon_base).
 build() {
-    local extra=("$@")
+    local tag="${IMAGE}" name base_id
     require_docker
     if [ ! -f "${REPO_DIR}/Dockerfile" ]; then
         echo "devenv: no Dockerfile in ${REPO_DIR}" >&2
@@ -120,42 +208,285 @@ build() {
         echo "devenv: its own. Symlink it instead of copying it." >&2
         exit 1
     fi
-    echo "devenv: building ${IMAGE}"
-    docker build "${extra[@]}" -t "${IMAGE}" "${REPO_DIR}"
+    build_image "${IMAGE}" "${REPO_DIR}" "$@"
+    if [ ${#ADDONS[@]} -gt 0 ]; then
+        base_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}")"
+        for name in "${ADDONS[@]}"; do
+            build_image "${tag}_${name}" "${REPO_DIR}/addons/${name}" \
+                --build-arg "BASE_IMAGE=${tag}" \
+                --label "devenv.base-id=${base_id}"
+            tag="${tag}_${name}"
+        done
+    fi
     echo "devenv: done"
-    docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt
+    docker run --rm --entrypoint cat "${SESSION_IMAGE}" /opt/devenv/versions.txt
 }
 
 # The AGENTS_REFRESH value the current image was built with, empty if there is
 # no image or it predates the label. Passing it back keeps a plain --build on
 # that image's agent layers; without it the build would match whichever cached
 # layers were built with the default, which after an --update are older ones.
-# A missing label prints "<no value>" rather than failing, hence the check.
 image_refresh() {
+    image_label "${IMAGE}" devenv.agents-refresh
+}
+
+# A label's value on an image, empty if the image or the label is missing.
+# A missing label prints "<no value>" rather than failing, hence the check.
+image_label() {
     local value
     value="$(docker image inspect \
-        --format '{{ index .Config.Labels "devenv.agents-refresh" }}' \
-        "${IMAGE}" 2>/dev/null)" || value=""
+        --format "{{ index .Config.Labels \"$2\" }}" \
+        "$1" 2>/dev/null)" || value=""
     [ "${value}" = "<no value>" ] && value=""
     printf '%s' "${value}"
 }
 
+# Warns, without stopping the session, when the add-on image was not built on
+# the base image as it is now. The usual cause is `devenv --update` without
+# --with: it replaces the base and leaves the add-on images on the old one, so
+# the session would quietly run the agents from before the update. A plain
+# --build with the same add-ons fixes it: the base comes from cache, and the
+# add-ons rebuild because their FROM has changed.
+#
+# Not an error: the image works, it is only older than expected, and refusing
+# to start would turn an out-of-date image into a blocked one.
+check_addon_base() {
+    local base_id built_on
+    base_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}" 2>/dev/null)" || base_id=""
+    built_on="$(image_label "${SESSION_IMAGE}" devenv.base-id)"
+    if [ -z "${base_id}" ]; then
+        echo "devenv: base image ${IMAGE} is not present, so ${SESSION_IMAGE}" >&2
+        echo "devenv: cannot be checked against it and may hold older agents." >&2
+    elif [ -z "${built_on}" ]; then
+        echo "devenv: ${SESSION_IMAGE} has no record of the base it was built on" >&2
+        echo "devenv: (built by an older launcher) and may hold older agents." >&2
+    elif [ "${built_on}" != "${base_id}" ]; then
+        echo "devenv: ${SESSION_IMAGE} was built on an older ${IMAGE}, so its" >&2
+        echo "devenv: agents are the ones from before the base was last rebuilt." >&2
+    else
+        return 0
+    fi
+    echo "devenv: rebuild it with: devenv --build${WITH_FLAGS}" >&2
+}
+
+# Converts a docker size (8g, 512m, 1024) to bytes. Fails on anything docker
+# would not accept, so the launcher can name the variable at fault instead of
+# leaving docker to answer "see usage".
+to_bytes() {
+    local value number unit
+    value="$(printf '%s' "${1}" | tr 'A-Z' 'a-z')"
+    [[ "${value}" =~ ^([0-9]+)(b|k|m|g|kb|mb|gb)?$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]:-}"
+    case "${unit}" in
+        ''|b)  echo "${number}" ;;
+        k|kb)  echo $(( number * 1024 )) ;;
+        m|mb)  echo $(( number * 1024 * 1024 )) ;;
+        g|gb)  echo $(( number * 1024 * 1024 * 1024 )) ;;
+    esac
+}
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "${s}"
+}
+
+# What an add-on may ask of `docker run`, read from addons/<name>/run.conf.
+#
+# The file declares values for a closed set of keys, and the launcher writes
+# the flags itself. It is deliberately not a list of flags to pass through: any
+# pass-through, however filtered, is a way to --privileged, --cap-add, -v,
+# --security-opt or --network, each of which undoes part of the sandbox from a
+# file that looks like configuration. A key that is not known is an error
+# rather than skipped, so a typo or a wish for more is seen instead of quietly
+# not applying. New keys are added here one at a time, each with its own check.
+#
+# The file is read line by line as data - never sourced, evaluated or expanded
+# - and every value is matched against a pattern before it goes anywhere near
+# the command line.
+#
+#   shm_size=<size>                  --shm-size; the largest across add-ons wins
+#   add_host=<hostname>:host-gateway --add-host; repeatable, merged across
+#                                    add-ons. Only host-gateway, never an
+#                                    address: an arbitrary IP would let an
+#                                    add-on redirect a name the allowlist trusts.
+ADD_HOST_RE='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:host-gateway$'
+
+has_run_host() {
+    local host
+    if [ ${#RUN_HOSTS[@]} -gt 0 ]; then
+        for host in "${RUN_HOSTS[@]}"; do
+            [ "${host}" = "$1" ] && return 0
+        done
+    fi
+    return 1
+}
+
+add_run_host() {
+    has_run_host "$1" || RUN_HOSTS+=("$1")
+}
+
+add_host_port() {
+    local port="$1" seen
+    if [[ ! "${port}" =~ ${PORT_RE} ]] || [ "${port}" -gt 65535 ]; then
+        echo "devenv: '${port}' is not a valid port for --host-port." >&2
+        echo "devenv: use a number from 1 to 65535, without leading zeros." >&2
+        exit 1
+    fi
+    if [ ${#HOST_PORTS[@]} -gt 0 ]; then
+        for seen in "${HOST_PORTS[@]}"; do
+            [ "${seen}" = "${port}" ] && return 0
+        done
+    fi
+    HOST_PORTS+=("${port}")
+}
+
+missing_host_port() {
+    echo "devenv: --host-port needs a port number, e.g. '--host-port 3000'." >&2
+    exit 1
+}
+
+run_conf_error() {
+    echo "devenv: add-on '$1', run.conf line $2: $3" >&2
+    echo "devenv: $4" >&2
+    exit 1
+}
+
+read_run_conf() {
+    local name="$1" file="${REPO_DIR}/addons/$1/run.conf"
+    local line text key value bytes n=0 have_shm="" adds=()
+    [ -e "${file}" ] || return 0
+    if [ ! -f "${file}" ] || [ ! -r "${file}" ]; then
+        echo "devenv: add-on '${name}': ${file} is not a readable regular file." >&2
+        exit 1
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+        n=$((n + 1))
+        text="$(trim "${line}")"
+        case "${text}" in
+            ''|'#'*) continue ;;
+            *=*)     ;;
+            *)       run_conf_error "${name}" "${n}" "${text}" \
+                         "expected key=value." ;;
+        esac
+        key="$(trim "${text%%=*}")"
+        value="$(trim "${text#*=}")"
+        case "${key}" in
+            shm_size)
+                if [ -n "${have_shm}" ]; then
+                    run_conf_error "${name}" "${n}" "${text}" \
+                        "shm_size is already set on line ${have_shm}."
+                fi
+                if ! bytes="$(to_bytes "${value}")"; then
+                    run_conf_error "${name}" "${n}" "${text}" \
+                        "shm_size takes a size: a whole number with an optional unit, e.g. 1g, 512m."
+                fi
+                have_shm="${n}"
+                adds+=(--shm-size="${value}")
+                SHM_COUNT=$((SHM_COUNT + 1))
+                SHM_LIST="${SHM_LIST:+${SHM_LIST}, }${value} from '${name}'"
+                if [ "${bytes}" -gt "${SHM_BYTES}" ]; then
+                    SHM_BYTES="${bytes}"
+                    SHM_SIZE="${value}"
+                    SHM_FROM="${name}"
+                fi ;;
+            add_host)
+                if [[ ! "${value}" =~ ${ADD_HOST_RE} ]]; then
+                    run_conf_error "${name}" "${n}" "${text}" \
+                        "add_host takes <hostname>:host-gateway, e.g. db.local:host-gateway; addresses are not accepted."
+                fi
+                adds+=(--add-host="${value}")
+                add_run_host "${value}" ;;
+            *)
+                run_conf_error "${name}" "${n}" "${text}" \
+                    "unknown key '${key}'; run.conf accepts shm_size and add_host only." ;;
+        esac
+    done < "${file}"
+    if [ ${#adds[@]} -gt 0 ]; then
+        RUN_NOTES+=("add-on '${name}' adds: ${adds[*]}")
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --build)    build --build-arg "AGENTS_REFRESH=$(image_refresh)"; exit 0 ;;
-        --update)   build --pull \
-                        --build-arg "AGENTS_REFRESH=$(date -u +%Y%m%dT%H%M%SZ)"
-                    exit 0 ;;
+        --build)    set_action build; shift ;;
+        --update)   set_action update; shift ;;
+        --versions) set_action versions; shift ;;
         --open)     FIREWALL="off"; shift ;;
         --nested-sandbox) NESTED="on"; shift ;;
-        --versions) require_docker; require_image
-                    docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
+        --with)     if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
+                        missing_addon_name
+                    fi
+                    add_addon "$2"; shift 2 ;;
+        --with=*)   [ -n "${1#--with=}" ] || missing_addon_name
+                    add_addon "${1#--with=}"; shift ;;
+        --host-port) if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
+                        missing_host_port
+                    fi
+                    add_host_port "$2"; shift 2 ;;
+        --host-port=*) [ -n "${1#--host-port=}" ] || missing_host_port
+                    add_host_port "${1#--host-port=}"; shift ;;
         -h|--help)  usage; exit 0 ;;
         --)         shift; break ;;
         -*)         echo "devenv: unknown option '$1'" >&2; usage >&2; exit 1 ;;
         *)          break ;;
     esac
 done
+
+# The image a session runs, and the flags that name it. Sorted and deduplicated
+# so the same set of add-ons is the same image whatever order the flags came
+# in. Names are validated and hold no newlines, so a line-based sort is safe;
+# read back in a loop because mapfile needs bash 4.
+#
+# Names are joined with '_', which ADDON_NAME_RE keeps out of every name. With
+# '-' as the separator `--with a-b` and `--with a --with b` were both
+# devenv:local-a-b, so a build of one silently replaced the other; with '_'
+# they are devenv:local_a-b and devenv:local_a_b. build() uses the same
+# separator for the tags along its chain.
+SESSION_IMAGE="${IMAGE}"
+WITH_FLAGS=""
+if [ ${#ADDONS[@]} -gt 0 ]; then
+    SORTED=()
+    while IFS= read -r name; do
+        SORTED+=("${name}")
+    done < <(printf '%s\n' "${ADDONS[@]}" | LC_ALL=C sort -u)
+    ADDONS=("${SORTED[@]}")
+    for name in "${ADDONS[@]}"; do
+        SESSION_IMAGE="${SESSION_IMAGE}_${name}"
+        WITH_FLAGS="${WITH_FLAGS} --with ${name}"
+    done
+
+    # Every run.conf is read here, before docker is touched and before any
+    # action runs, so an add-on with a broken one cannot be built either: the
+    # image would only fail at the first session. What each adds is kept for
+    # the session start, where it is printed alongside the rest.
+    for name in "${ADDONS[@]}"; do
+        read_run_conf "${name}"
+    done
+    if [ -n "${SHM_SIZE}" ]; then
+        if [ "${SHM_COUNT}" -gt 1 ]; then
+            RUN_NOTES+=("add-ons ask for different shm sizes (${SHM_LIST});")
+            RUN_NOTES+=("using the largest, --shm-size=${SHM_SIZE} from add-on '${SHM_FROM}'.")
+        fi
+        ADDON_RUN+=(--shm-size="${SHM_SIZE}")
+    fi
+    if [ ${#RUN_HOSTS[@]} -gt 0 ]; then
+        for host in "${RUN_HOSTS[@]}"; do
+            ADDON_RUN+=(--add-host="${host}")
+        done
+    fi
+fi
+
+case "${ACTION}" in
+    build)    build --build-arg "AGENTS_REFRESH=$(image_refresh)"; exit 0 ;;
+    update)   build --pull \
+                  --build-arg "AGENTS_REFRESH=$(date -u +%Y%m%dT%H%M%SZ)"
+              exit 0 ;;
+    versions) require_docker; require_image
+              docker run --rm --entrypoint cat "${SESSION_IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
+esac
 
 require_docker
 require_image
@@ -199,6 +530,18 @@ if [ -n "$(docker ps -q --filter "label=${LABEL}")" ]; then
     exit 1
 fi
 
+# Named on every start: an add-on changes what the session can run, and it is
+# chosen per run, so the line is the only record of which ones this one has.
+if [ ${#ADDONS[@]} -gt 0 ]; then
+    echo "devenv: add-ons this session: ${ADDONS[*]} (image ${SESSION_IMAGE})" >&2
+    check_addon_base
+    if [ ${#RUN_NOTES[@]} -gt 0 ]; then
+        for note in "${RUN_NOTES[@]}"; do
+            echo "devenv: ${note}" >&2
+        done
+    fi
+fi
+
 # Credential volumes, one per agent. Mounting all three into every session lets
 # any agent read the others' tokens, so the volume follows the agent being
 # launched. The command decides, not DEVENV_AGENT: that is an identity label,
@@ -239,22 +582,27 @@ if [ "${NESTED}" = "on" ]; then
     echo "devenv: user namespaces enabled; the seccomp filter is OFF this session" >&2
 fi
 
-# Converts a docker size (8g, 512m, 1024) to bytes. Fails on anything docker
-# would not accept, so the launcher can name the variable at fault instead of
-# leaving docker to answer "see usage".
-to_bytes() {
-    local value number unit
-    value="$(printf '%s' "${1}" | tr 'A-Z' 'a-z')"
-    [[ "${value}" =~ ^([0-9]+)(b|k|m|g|kb|mb|gb)?$ ]] || return 1
-    number="${BASH_REMATCH[1]}"
-    unit="${BASH_REMATCH[2]:-}"
-    case "${unit}" in
-        ''|b)  echo "${number}" ;;
-        k|kb)  echo $(( number * 1024 )) ;;
-        m|mb)  echo $(( number * 1024 * 1024 )) ;;
-        g|gb)  echo $(( number * 1024 * 1024 * 1024 )) ;;
-    esac
-}
+# Ports on the host the session may reach - a dev server, a database the
+# project talks to. Chosen per session like --nested-sandbox and for the same
+# reason: there is no environment variable for it, so a hole in the filter
+# cannot be set once in .env.local and forgotten. The launcher only names the
+# ports; init-firewall.sh opens each of them to the gateway address alone, and
+# checks them again itself.
+HOST_ACCESS=()
+if [ ${#HOST_PORTS[@]} -gt 0 ]; then
+    # An add-on may have declared the same name already; it is one host entry,
+    # so it goes on the command line once.
+    if ! has_run_host "host.docker.internal:host-gateway"; then
+        HOST_ACCESS+=(--add-host=host.docker.internal:host-gateway)
+    fi
+    HOST_ACCESS+=(-e "DEVENV_HOST_PORTS=${HOST_PORTS[*]}")
+    if [ "${FIREWALL}" = "on" ]; then
+        echo "devenv: host ports open this session: ${HOST_PORTS[*]} (host.docker.internal)" >&2
+    else
+        echo "devenv: --host-port with the egress filter off: every port on the host is" >&2
+        echo "devenv: reachable anyway. host.docker.internal is still added." >&2
+    fi
+fi
 
 # Resource limits. Unset means unlimited, which is the default: an empty value
 # must not reach docker, which rejects '--cpus=' outright.
@@ -329,6 +677,8 @@ exec docker run --rm -it --init \
     -e "TERM=${TERM:-xterm-256color}" \
     "${CAPS[@]}" \
     "${SECCOMP[@]}" \
+    "${HOST_ACCESS[@]}" \
     "${LIMITS[@]}" \
-    "${IMAGE}" \
+    "${ADDON_RUN[@]}" \
+    "${SESSION_IMAGE}" \
     "${@:-bash}"

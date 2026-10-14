@@ -1,0 +1,108 @@
+#!/bin/sh
+# Starts the Playwright MCP server the way this sandbox needs it.
+#
+# Installed as /opt/devenv/bin/playwright-mcp, ahead of the package's own
+# playwright-mcp in /usr/local/bin, so an MCP config that names the command
+# gets these flags without having to know them:
+#
+#   --headless          the container has no display to open a window on.
+#   --browser chromium  without it the server asks for Google Chrome, which is
+#                       not in the image. chromium is the build this add-on
+#                       installed, the revision this server's playwright expects.
+#   --isolated          the browser profile stays in memory, so every start is
+#                       a clean browser and nothing is written to disk for it.
+#   --no-sandbox        Chromium's own sandbox needs user namespaces, which
+#                       docker's default seccomp profile denies. The container
+#                       is the isolation boundary instead: the renderer runs
+#                       with exactly the rights the agent has, as the node user,
+#                       behind the same egress filter. Playwright already turns
+#                       the sandbox off for this browser on Linux; saying so here
+#                       keeps it from depending on that default.
+#
+# Anything else is passed on, so a project can add --viewport-size and the
+# like.
+#
+# Two settings get a default of the wrapper's own, each only when the project
+# has not chosen it - as a flag (--x value or --x=value), through the server's
+# environment variable, or in the config file given by --config or
+# PLAYWRIGHT_MCP_CONFIG. They have to be looked for rather than overridden: the
+# server ranks a command-line flag above the environment and the config file,
+# so a default passed unconditionally would silently replace either. For a
+# repeated flag it takes the last one, but two values on one command line are a
+# trap for the next person to read it, so a chosen setting is detected and the
+# default left out.
+#
+# --output-dir /tmp/playwright-mcp (PLAYWRIGHT_MCP_OUTPUT_DIR, outputDir).
+# The server's own default is .playwright-mcp under its working directory,
+# which here is /app - the project on the host. It writes a page snapshot and a
+# console log there on nearly every call, so they pile up in the working tree
+# and are one `git add -A` away from a commit. /tmp is in the container and goes
+# with it. A project that wants the files kept passes --output-dir itself, say
+# `--output-dir .playwright-mcp` for the old place, and adds that directory to
+# its .gitignore.
+#
+# --file-paths absolute (PLAYWRIGHT_MCP_FILE_PATHS, filePaths). The server's
+# default is paths relative to its own working directory, so a snapshot shows
+# as ../tmp/playwright-mcp/page-<time>.yml. That is right only while the agent
+# resolves it from /app too; an agent working in a subdirectory of a monorepo
+# would look for the file somewhere else. An absolute path names the same file
+# from anywhere. A project that prefers relative paths says so the same ways.
+#
+# node and the server are called by absolute path. The virtualenv precedes
+# /usr/local/bin in PATH and is writable, so a package installed into it could
+# otherwise put its own node in front of this one.
+set -eu
+
+NODE=/usr/local/bin/node
+SERVER=/usr/local/lib/node_modules/@playwright/mcp/cli.js
+DEFAULT_OUTPUT_DIR=/tmp/playwright-mcp
+
+# Whether the config file, if there is one, sets a top-level key. The server
+# reads JSON, or INI when the file is not JSON; an unreadable file counts as not
+# setting it, and the server reports it when it tries to load it.
+config_sets() {
+    [ -n "$config" ] || return 1
+    "$NODE" -e '
+        const [file, key] = process.argv.slice(1);
+        const text = require("fs").readFileSync(file, "utf8").replace(/^\uFEFF/, "");
+        let set;
+        try { set = JSON.parse(text)[key] !== undefined; }
+        catch { set = new RegExp("^\\s*" + key + "\\s*=", "m").test(text); }
+        process.exit(set ? 0 : 1);
+    ' "$config" "$1" 2>/dev/null
+}
+
+output_dir_chosen=""
+file_paths_chosen=""
+[ -n "${PLAYWRIGHT_MCP_OUTPUT_DIR:-}" ] && output_dir_chosen=1
+[ -n "${PLAYWRIGHT_MCP_FILE_PATHS:-}" ] && file_paths_chosen=1
+config="${PLAYWRIGHT_MCP_CONFIG:-}"
+config_next=""
+for arg in "$@"; do
+    if [ -n "$config_next" ]; then
+        config="$arg"
+        config_next=""
+        continue
+    fi
+    case "$arg" in
+        --output-dir|--output-dir=*) output_dir_chosen=1 ;;
+        --file-paths|--file-paths=*) file_paths_chosen=1 ;;
+        --config)                    config_next=1 ;;
+        --config=*)                  config="${arg#--config=}" ;;
+    esac
+done
+if [ -z "$output_dir_chosen" ] && config_sets outputDir; then
+    output_dir_chosen=1
+fi
+if [ -z "$file_paths_chosen" ] && config_sets filePaths; then
+    file_paths_chosen=1
+fi
+
+if [ -z "$file_paths_chosen" ]; then
+    set -- --file-paths absolute "$@"
+fi
+if [ -z "$output_dir_chosen" ]; then
+    set -- --output-dir "$DEFAULT_OUTPUT_DIR" "$@"
+fi
+
+exec "$NODE" "$SERVER" --headless --browser chromium --isolated --no-sandbox "$@"
