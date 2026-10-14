@@ -104,16 +104,20 @@ Options:
   --host-port PORT
                  Let the session reach this TCP port on the host, as
                  host.docker.internal. Repeatable; for this run only.
-  --with NAME   Add the add-on in addons/NAME on top of the image, for this
+  --with NAME    Add the add-on in addons/NAME on top of the image, for this
                  run only. Repeatable. With --build or --update, builds it.
   -h, --help     Show this help.
 
-Anything after '--' is passed to the container untouched.
+Options go before the command. Everything from the first word that is not an
+option is the command, so `devenv claude --host-port 3000` hands --host-port
+to Claude Code. Anything after '--' is passed to the container untouched.
 
 Examples:
   devenv                     # shell in the sandbox
   devenv claude              # Claude Code, scoped to this directory
   devenv --open codex        # Codex with unrestricted network
+  devenv --host-port 3000 claude
+                             # Claude Code, able to reach port 3000 on the host
 EOF
 }
 
