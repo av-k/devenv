@@ -55,6 +55,14 @@ IMAGE="${DEVENV_IMAGE:-devenv:local}"
 ALLOWLIST="${DEVENV_ALLOWLIST_FILE:-${REPO_DIR}/allowlist.txt}"
 FIREWALL="on"
 NESTED="off"
+ADDONS=()
+ACTION=""
+
+# An add-on's name becomes both a path under addons/ and part of an image tag,
+# so it is held to a shape that is safe as either: no '/', no '.', nothing that
+# could walk out of addons/ or split the tag. Kept in a variable because a
+# quoted pattern on the right of =~ is matched literally since bash 3.2.
+ADDON_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 
 usage() {
     cat <<'EOF'
@@ -72,6 +80,8 @@ Options:
                  Turns off the seccomp filter for the session; read the
                  README before using it.
   --versions     Print the tool versions baked into the image, then exit.
+  --with NAME    Add the add-on in addons/NAME on top of the image, for this
+                 run only. Repeatable. With --build or --update, builds it.
   -h, --help     Show this help.
 
 Anything after '--' is passed to the container untouched.
@@ -104,14 +114,59 @@ require_docker() {
 # of docker trying to pull devenv:local from a registry and answering with
 # "pull access denied ... may require 'docker login'".
 require_image() {
-    if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-        echo "devenv: image ${IMAGE} not found. Run 'devenv --build' first." >&2
+    if ! docker image inspect "${SESSION_IMAGE}" >/dev/null 2>&1; then
+        echo "devenv: image ${SESSION_IMAGE} not found. Run 'devenv --build${WITH_FLAGS}' first." >&2
         exit 1
     fi
 }
 
+add_addon() {
+    local name="$1"
+    if [[ ! "${name}" =~ ${ADDON_NAME_RE} ]]; then
+        echo "devenv: '${name}' is not a valid add-on name." >&2
+        echo "devenv: use lowercase letters, digits and '-', starting with a" >&2
+        echo "devenv: letter or digit." >&2
+        exit 1
+    fi
+    if [ ! -f "${REPO_DIR}/addons/${name}/Dockerfile" ]; then
+        echo "devenv: no add-on '${name}': expected ${REPO_DIR}/addons/${name}/Dockerfile" >&2
+        exit 1
+    fi
+    ADDONS+=("${name}")
+}
+
+missing_addon_name() {
+    echo "devenv: --with needs an add-on name, e.g. '--with playwright'." >&2
+    exit 1
+}
+
+# Actions run once every flag has been read, so `--build --with x` builds x as
+# well. Two of them would have the first silently win, so that is refused.
+set_action() {
+    if [ -n "${ACTION}" ] && [ "${ACTION}" != "$1" ]; then
+        echo "devenv: --${ACTION} and --$1 cannot be combined." >&2
+        exit 1
+    fi
+    ACTION="$1"
+}
+
+build_image() {
+    local tag="$1" context="$2"
+    shift 2
+    echo "devenv: building ${tag}"
+    docker build "$@" -t "${tag}" "${context}"
+}
+
+# Builds the base with the options given, then each add-on on top of the one
+# before it. The options are the base's alone: --pull in particular would send
+# an add-on looking for its FROM - a local image - in a registry, and fail.
+# An add-on needs no cache option of its own either: a rebuilt base has a new
+# ID, so its FROM changes and its layers miss the cache anyway.
+#
+# Each add-on's context is its own directory, so its build sees its own files
+# and nothing of the repository's, .env.local included.
 build() {
-    local extra=("$@")
+    local tag="${IMAGE}" name
     require_docker
     if [ ! -f "${REPO_DIR}/Dockerfile" ]; then
         echo "devenv: no Dockerfile in ${REPO_DIR}" >&2
@@ -120,10 +175,16 @@ build() {
         echo "devenv: its own. Symlink it instead of copying it." >&2
         exit 1
     fi
-    echo "devenv: building ${IMAGE}"
-    docker build "${extra[@]}" -t "${IMAGE}" "${REPO_DIR}"
+    build_image "${IMAGE}" "${REPO_DIR}" "$@"
+    if [ ${#ADDONS[@]} -gt 0 ]; then
+        for name in "${ADDONS[@]}"; do
+            build_image "${tag}-${name}" "${REPO_DIR}/addons/${name}" \
+                --build-arg "BASE_IMAGE=${tag}"
+            tag="${tag}-${name}"
+        done
+    fi
     echo "devenv: done"
-    docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt
+    docker run --rm --entrypoint cat "${SESSION_IMAGE}" /opt/devenv/versions.txt
 }
 
 # The AGENTS_REFRESH value the current image was built with, empty if there is
@@ -142,20 +203,50 @@ image_refresh() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --build)    build --build-arg "AGENTS_REFRESH=$(image_refresh)"; exit 0 ;;
-        --update)   build --pull \
-                        --build-arg "AGENTS_REFRESH=$(date -u +%Y%m%dT%H%M%SZ)"
-                    exit 0 ;;
+        --build)    set_action build; shift ;;
+        --update)   set_action update; shift ;;
+        --versions) set_action versions; shift ;;
         --open)     FIREWALL="off"; shift ;;
         --nested-sandbox) NESTED="on"; shift ;;
-        --versions) require_docker; require_image
-                    docker run --rm --entrypoint cat "${IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
+        --with)     if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
+                        missing_addon_name
+                    fi
+                    add_addon "$2"; shift 2 ;;
+        --with=*)   [ -n "${1#--with=}" ] || missing_addon_name
+                    add_addon "${1#--with=}"; shift ;;
         -h|--help)  usage; exit 0 ;;
         --)         shift; break ;;
         -*)         echo "devenv: unknown option '$1'" >&2; usage >&2; exit 1 ;;
         *)          break ;;
     esac
 done
+
+# The image a session runs, and the flags that name it. Sorted and deduplicated
+# so the same set of add-ons is the same image whatever order the flags came
+# in. Names are validated and hold no newlines, so a line-based sort is safe;
+# read back in a loop because mapfile needs bash 4.
+SESSION_IMAGE="${IMAGE}"
+WITH_FLAGS=""
+if [ ${#ADDONS[@]} -gt 0 ]; then
+    SORTED=()
+    while IFS= read -r name; do
+        SORTED+=("${name}")
+    done < <(printf '%s\n' "${ADDONS[@]}" | LC_ALL=C sort -u)
+    ADDONS=("${SORTED[@]}")
+    for name in "${ADDONS[@]}"; do
+        SESSION_IMAGE="${SESSION_IMAGE}-${name}"
+        WITH_FLAGS="${WITH_FLAGS} --with ${name}"
+    done
+fi
+
+case "${ACTION}" in
+    build)    build --build-arg "AGENTS_REFRESH=$(image_refresh)"; exit 0 ;;
+    update)   build --pull \
+                  --build-arg "AGENTS_REFRESH=$(date -u +%Y%m%dT%H%M%SZ)"
+              exit 0 ;;
+    versions) require_docker; require_image
+              docker run --rm --entrypoint cat "${SESSION_IMAGE}" /opt/devenv/versions.txt; exit 0 ;;
+esac
 
 require_docker
 require_image
@@ -197,6 +288,12 @@ if [ -n "$(docker ps -q --filter "label=${LABEL}")" ]; then
     echo "devenv: a session is already running for ${WORKDIR}" >&2
     echo "devenv: use a separate git worktree for a second agent." >&2
     exit 1
+fi
+
+# Named on every start: an add-on changes what the session can run, and it is
+# chosen per run, so the line is the only record of which ones this one has.
+if [ ${#ADDONS[@]} -gt 0 ]; then
+    echo "devenv: add-ons this session: ${ADDONS[*]} (image ${SESSION_IMAGE})" >&2
 fi
 
 # Credential volumes, one per agent. Mounting all three into every session lets
@@ -330,5 +427,5 @@ exec docker run --rm -it --init \
     "${CAPS[@]}" \
     "${SECCOMP[@]}" \
     "${LIMITS[@]}" \
-    "${IMAGE}" \
+    "${SESSION_IMAGE}" \
     "${@:-bash}"
