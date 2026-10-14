@@ -62,6 +62,11 @@ ACTION=""
 # so it is held to a shape that is safe as either: no '/', no '.', nothing that
 # could walk out of addons/ or split the tag. Kept in a variable because a
 # quoted pattern on the right of =~ is matched literally since bash 3.2.
+#
+# '_' is left out on purpose: it is the separator between names in the tag
+# (devenv:local_a_b), and only because no name can contain it does a tag map
+# back to exactly one set of add-ons. Allow '_' here and `--with a_b` collides
+# with `--with a --with b` again - both would build and run devenv:local_a_b.
 ADDON_NAME_RE='^[a-z0-9][a-z0-9-]*$'
 
 usage() {
@@ -165,8 +170,13 @@ build_image() {
 #
 # Each add-on's context is its own directory, so its build sees its own files
 # and nothing of the repository's, .env.local included.
+#
+# Every add-on image is labelled with the ID of the base it was built on. A
+# later --update without --with replaces the base and leaves the add-on images
+# where they were, still holding the old agents; the label is how a session
+# started with --with notices (see check_addon_base).
 build() {
-    local tag="${IMAGE}" name
+    local tag="${IMAGE}" name base_id
     require_docker
     if [ ! -f "${REPO_DIR}/Dockerfile" ]; then
         echo "devenv: no Dockerfile in ${REPO_DIR}" >&2
@@ -177,10 +187,12 @@ build() {
     fi
     build_image "${IMAGE}" "${REPO_DIR}" "$@"
     if [ ${#ADDONS[@]} -gt 0 ]; then
+        base_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}")"
         for name in "${ADDONS[@]}"; do
-            build_image "${tag}-${name}" "${REPO_DIR}/addons/${name}" \
-                --build-arg "BASE_IMAGE=${tag}"
-            tag="${tag}-${name}"
+            build_image "${tag}_${name}" "${REPO_DIR}/addons/${name}" \
+                --build-arg "BASE_IMAGE=${tag}" \
+                --label "devenv.base-id=${base_id}"
+            tag="${tag}_${name}"
         done
     fi
     echo "devenv: done"
@@ -191,14 +203,47 @@ build() {
 # no image or it predates the label. Passing it back keeps a plain --build on
 # that image's agent layers; without it the build would match whichever cached
 # layers were built with the default, which after an --update are older ones.
-# A missing label prints "<no value>" rather than failing, hence the check.
 image_refresh() {
+    image_label "${IMAGE}" devenv.agents-refresh
+}
+
+# A label's value on an image, empty if the image or the label is missing.
+# A missing label prints "<no value>" rather than failing, hence the check.
+image_label() {
     local value
     value="$(docker image inspect \
-        --format '{{ index .Config.Labels "devenv.agents-refresh" }}' \
-        "${IMAGE}" 2>/dev/null)" || value=""
+        --format "{{ index .Config.Labels \"$2\" }}" \
+        "$1" 2>/dev/null)" || value=""
     [ "${value}" = "<no value>" ] && value=""
     printf '%s' "${value}"
+}
+
+# Warns, without stopping the session, when the add-on image was not built on
+# the base image as it is now. The usual cause is `devenv --update` without
+# --with: it replaces the base and leaves the add-on images on the old one, so
+# the session would quietly run the agents from before the update. A plain
+# --build with the same add-ons fixes it: the base comes from cache, and the
+# add-ons rebuild because their FROM has changed.
+#
+# Not an error: the image works, it is only older than expected, and refusing
+# to start would turn an out-of-date image into a blocked one.
+check_addon_base() {
+    local base_id built_on
+    base_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}" 2>/dev/null)" || base_id=""
+    built_on="$(image_label "${SESSION_IMAGE}" devenv.base-id)"
+    if [ -z "${base_id}" ]; then
+        echo "devenv: base image ${IMAGE} is not present, so ${SESSION_IMAGE}" >&2
+        echo "devenv: cannot be checked against it and may hold older agents." >&2
+    elif [ -z "${built_on}" ]; then
+        echo "devenv: ${SESSION_IMAGE} has no record of the base it was built on" >&2
+        echo "devenv: (built by an older launcher) and may hold older agents." >&2
+    elif [ "${built_on}" != "${base_id}" ]; then
+        echo "devenv: ${SESSION_IMAGE} was built on an older ${IMAGE}, so its" >&2
+        echo "devenv: agents are the ones from before the base was last rebuilt." >&2
+    else
+        return 0
+    fi
+    echo "devenv: rebuild it with: devenv --build${WITH_FLAGS}" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -225,6 +270,12 @@ done
 # so the same set of add-ons is the same image whatever order the flags came
 # in. Names are validated and hold no newlines, so a line-based sort is safe;
 # read back in a loop because mapfile needs bash 4.
+#
+# Names are joined with '_', which ADDON_NAME_RE keeps out of every name. With
+# '-' as the separator `--with a-b` and `--with a --with b` were both
+# devenv:local-a-b, so a build of one silently replaced the other; with '_'
+# they are devenv:local_a-b and devenv:local_a_b. build() uses the same
+# separator for the tags along its chain.
 SESSION_IMAGE="${IMAGE}"
 WITH_FLAGS=""
 if [ ${#ADDONS[@]} -gt 0 ]; then
@@ -234,7 +285,7 @@ if [ ${#ADDONS[@]} -gt 0 ]; then
     done < <(printf '%s\n' "${ADDONS[@]}" | LC_ALL=C sort -u)
     ADDONS=("${SORTED[@]}")
     for name in "${ADDONS[@]}"; do
-        SESSION_IMAGE="${SESSION_IMAGE}-${name}"
+        SESSION_IMAGE="${SESSION_IMAGE}_${name}"
         WITH_FLAGS="${WITH_FLAGS} --with ${name}"
     done
 fi
@@ -294,6 +345,7 @@ fi
 # chosen per run, so the line is the only record of which ones this one has.
 if [ ${#ADDONS[@]} -gt 0 ]; then
     echo "devenv: add-ons this session: ${ADDONS[*]} (image ${SESSION_IMAGE})" >&2
+    check_addon_base
 fi
 
 # Credential volumes, one per agent. Mounting all three into every session lets
