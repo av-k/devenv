@@ -1,0 +1,31 @@
+#!/bin/sh
+# Starts the Playwright MCP server the way this sandbox needs it.
+#
+# Installed as /opt/devenv/bin/playwright-mcp, ahead of the package's own
+# playwright-mcp in /usr/local/bin, so an MCP config that names the command
+# gets these flags without having to know them:
+#
+#   --headless          the container has no display to open a window on.
+#   --browser chromium  without it the server asks for Google Chrome, which is
+#                       not in the image. chromium is the build this add-on
+#                       installed, the revision this server's playwright expects.
+#   --isolated          the browser profile stays in memory, so every start is
+#                       a clean browser and nothing is written to disk for it.
+#   --no-sandbox        Chromium's own sandbox needs user namespaces, which
+#                       docker's default seccomp profile denies. The container
+#                       is the isolation boundary instead: the renderer runs
+#                       with exactly the rights the agent has, as the node user,
+#                       behind the same egress filter. Playwright already turns
+#                       the sandbox off for this browser on Linux; saying so here
+#                       keeps it from depending on that default.
+#
+# Anything else is passed on, so a project can add --output-dir,
+# --viewport-size and the like.
+#
+# node and the server are called by absolute path. The virtualenv precedes
+# /usr/local/bin in PATH and is writable, so a package installed into it could
+# otherwise put its own node in front of this one.
+set -eu
+
+exec /usr/local/bin/node /usr/local/lib/node_modules/@playwright/mcp/cli.js \
+    --headless --browser chromium --isolated --no-sandbox "$@"
