@@ -55,6 +55,7 @@ IMAGE="${DEVENV_IMAGE:-devenv:local}"
 ALLOWLIST="${DEVENV_ALLOWLIST_FILE:-${REPO_DIR}/allowlist.txt}"
 FIREWALL="on"
 NESTED="off"
+SHARED="off"
 ADDONS=()
 ACTION=""
 
@@ -104,6 +105,8 @@ Options:
   --host-port PORT
                  Let the session reach this TCP port on the host, as
                  host.docker.internal. Repeatable; for this run only.
+  --shared       Start even if a session is already running in this
+                 directory. For this run only.
   --with NAME    Add the add-on in addons/NAME on top of the image, for this
                  run only. Repeatable. With --build or --update, builds it.
   -h, --help     Show this help.
@@ -118,6 +121,7 @@ Examples:
   devenv --open codex        # Codex with unrestricted network
   devenv --host-port 3000 claude
                              # Claude Code, able to reach port 3000 on the host
+  devenv --shared codex      # Codex next to a session already running here
 EOF
 }
 
@@ -416,6 +420,7 @@ while [[ $# -gt 0 ]]; do
         --versions) set_action versions; shift ;;
         --open)     FIREWALL="off"; shift ;;
         --nested-sandbox) NESTED="on"; shift ;;
+        --shared)   SHARED="on"; shift ;;
         --with)     if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
                         missing_addon_name
                     fi
@@ -522,13 +527,60 @@ fi
 WORKDIR="$(pwd)"
 LABEL="devenv=${WORKDIR}"
 
-# One session per directory. Two agents sharing a working tree corrupt each
-# other's edits.
-if [ -n "$(docker ps -q --filter "label=${LABEL}")" ]; then
-    echo "devenv: a session is already running for ${WORKDIR}" >&2
-    echo "devenv: use a separate git worktree for a second agent." >&2
-    exit 1
+# The agent the session runs, decided by the command. Anything that is not an
+# agent - a plain shell, a script, `npm test` - counts as "shell".
+case "${1:-}" in
+    claude|codex|agy) AGENT="$1" ;;
+    *)                AGENT="shell" ;;
+esac
+
+# One session per directory unless --shared says otherwise. Two agents sharing
+# a working tree corrupt each other's edits, so a second one is a choice made
+# per launch; like --nested-sandbox there is no environment variable for it.
+#
+# The flag goes on the session that joins. The one already running was started
+# by the same person, who is the one deciding now.
+RUNNING="$(docker ps --filter "label=${LABEL}" --format '{{.Names}}')"
+if [ -n "${RUNNING}" ]; then
+    if [ "${SHARED}" = "off" ]; then
+        echo "devenv: a session is already running for ${WORKDIR}:" >&2
+        printf '%s\n' "${RUNNING}" | sed 's/^/devenv:   /' >&2
+        echo "devenv: use a separate clone or worktree for a second agent, or" >&2
+        echo "devenv: start it with --shared to run it in this directory too." >&2
+        exit 1
+    fi
+    echo "devenv: --shared: this directory is also used by" \
+        "$(printf '%s' "${RUNNING}" | tr '\n' ' ')" >&2
 fi
+
+# A name of the form <base>-<checksum>: the directory's own name, cut down to
+# what docker allows in a container name, and a checksum of the full path. Two
+# checkouts called "app" in different places are different projects, and their
+# sessions must not compete for one name. cksum because it is POSIX; md5sum and
+# sha1sum are not under those names on macOS.
+project_slug() {
+    local base sum
+    base="$(printf '%s' "${1##*/}" | tr 'A-Z' 'a-z' | LC_ALL=C tr -c 'a-z0-9_.-' '-')"
+    base="${base:0:40}"
+    sum="$(printf '%s' "$1" | cksum)"
+    printf '%s-%08x' "${base:-root}" "${sum%% *}"
+}
+
+# The container's name, devenv-<project>-<agent>-<n>, e.g.
+# devenv-my-service-1a2b3c4d-claude-2. It is what `docker exec` takes, and with
+# several sessions in one directory a label filter would return all of them.
+#
+# <n> is the lowest number no container of this project and agent holds,
+# running or stopped - docker refuses a name in use either way. The first
+# claude is 1, a second one next to it is 2, and once the first has ended the
+# next claude takes 1 again. Two launches racing for one number cannot both get
+# it: the second fails with docker's "Conflict" error and can just be rerun.
+SESSION_PREFIX="devenv-$(project_slug "${WORKDIR}")-${AGENT}"
+SESSION_N=1
+while docker container inspect "${SESSION_PREFIX}-${SESSION_N}" >/dev/null 2>&1; do
+    SESSION_N=$((SESSION_N + 1))
+done
+SESSION_NAME="${SESSION_PREFIX}-${SESSION_N}"
 
 # Named on every start: an add-on changes what the session can run, and it is
 # chosen per run, so the line is the only record of which ones this one has.
@@ -548,7 +600,7 @@ fi
 # and keeping the two apart means `DEVENV_AGENT=claude-review devenv claude`
 # still gets Claude's volume and nobody has to think about it.
 CREDS=()
-case "${1:-}" in
+case "${AGENT}" in
     claude) CREDS=(-v devenv-claude:/home/node/.claude) ;;
     codex)  CREDS=(-v devenv-codex:/home/node/.codex) ;;
     agy)    CREDS=(-v devenv-gemini:/home/node/.gemini) ;;
@@ -666,7 +718,10 @@ fi
 # with commas rather than colons: ':ro,z', not ':ro:z'.
 ALLOWLIST_OPTS=":ro${MOUNT_SUFFIX:+,${MOUNT_SUFFIX#:}}"
 
+echo "devenv: session ${SESSION_NAME}" >&2
+
 exec docker run --rm -it --init \
+    --name "${SESSION_NAME}" \
     --label "${LABEL}" \
     --hostname devenv \
     -v "${WORKDIR}:/app${MOUNT_SUFFIX}" \
