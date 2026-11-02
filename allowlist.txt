@@ -6,10 +6,9 @@
 # This list applies to IPv4. Outbound IPv6 is closed entirely and is not
 # configurable here.
 #
-# To see what was refused, read the filter's counters from the host, in the
-# project directory of the running session:
-#   docker exec -u root "$(docker ps -q --filter "label=devenv=$PWD")" \
-#       iptables -L OUTPUT -v -n --line-numbers
+# To see what was refused, read the filter's counters from the host, using the
+# session name the launcher prints at start ("devenv: session <name>"):
+#   docker exec -u root <name> iptables -L OUTPUT -v -n --line-numbers
 # (ip6tables for IPv6). Denied attempts also hit a LOG rule with the prefix
 # "devenv-deny:" ("devenv-deny6:" for IPv6), but dmesg and journalctl show
 # nothing by default: the rule fires in the container's network namespace,

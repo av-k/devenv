@@ -101,6 +101,7 @@ you are in.
 | `--versions` | Print the tool versions baked into the image |
 | `--with NAME` | Run on top of the add-on in `addons/NAME`, for this run only. Repeatable; with `--build` or `--update`, builds it — see [Add-ons](#add-ons) |
 | `--host-port PORT` | Let the session reach this TCP port on the host, as `host.docker.internal`. Repeatable, for this run only — see [Reaching services on the host](#reaching-services-on-the-host) |
+| `--shared` | Start even if a session is already running in this directory, for this run only — see [Two sessions in one directory](#two-sessions-in-one-directory) |
 
 **devenv's flags go before the command.** The launcher reads flags until the
 first word that is not one, and everything from there on is the command run
@@ -119,7 +120,23 @@ devenv -- claude --version
 ```
 
 Only one session runs per directory; a second launch in the same directory is
-refused. See [Working with more than one agent](#working-with-more-than-one-agent).
+refused unless it is started with `--shared`. See
+[Working with more than one agent](#working-with-more-than-one-agent).
+
+Every session has a container name, printed when it starts:
+
+```
+devenv: session devenv-my-service-1a2b3c4d-claude-1
+```
+
+It is `devenv-<project>-<agent>-<n>`. `<project>` is the launch directory's
+name and a checksum of its full path, so two checkouts called `my-service` in
+different places get different names. `<agent>` is `claude`, `codex`, `agy`,
+or `shell` for anything else. `<n>` is the lowest number not taken by another
+container of the same project and agent: the first claude is `1`, a second
+claude next to it `2`, a codex next to them `codex-1`. When a session ends its
+number is free again. `docker exec`, `docker stop` and `docker logs` take this
+name.
 
 ---
 
@@ -136,13 +153,59 @@ agent on one copy.
 ### One session per directory
 
 The launcher labels each container `devenv=<launch directory>` and refuses to
-start a second one for a directory that already has a session.
+start a second one for a directory that already has a session, unless the
+second is started with `--shared`.
 
 This is not caution about a rare race. Two agents in one working tree lose each
 other's work as a matter of course: editing a file is read-modify-write and
 nothing about it is transactional, so the second agent's write lands on top of
 a file it read before the first agent touched it. Add a formatter, or a test
 runner writing snapshots, and it gets worse. One tree, one agent.
+
+### Two sessions in one directory
+
+Sometimes the work needs two agents on the same tree — one writes, the other
+reviews, or each works in its own part of a larger checkout. `--shared` lets a
+session start next to the ones already running there:
+
+```bash
+devenv claude                  # first session: devenv-my-service-1a2b3c4d-claude-1
+devenv --shared codex          # second:        devenv-my-service-1a2b3c4d-codex-1
+devenv --shared claude         # third:         devenv-my-service-1a2b3c4d-claude-2
+```
+
+```
+devenv: --shared: this directory is also used by devenv-my-service-1a2b3c4d-claude-1
+devenv: session devenv-my-service-1a2b3c4d-codex-1
+```
+
+Without the flag the launch is refused and the running sessions are named. The
+flag goes on the session that joins, and like `--nested-sandbox` it has no
+setting in `.env.local`: sharing a tree is chosen per launch, not once and
+forgotten.
+
+Each session is a container of its own, with its own flags — add-ons, host
+ports, the egress filter or `--open` — its own resource limits, and only its
+own agent's credential volume. Two Claude Code sessions mount the same
+`devenv-claude` volume, as two Claude Code windows on one machine share
+`~/.claude`.
+
+**What the flag does not do** is make the sharing safe. The agents still have
+one working tree, one `HEAD` and one index between them:
+
+- `git checkout` or `git switch` by one agent changes the files under the
+  other.
+- `git add` or `git commit` at the same moment fails with
+  `Unable to create '.git/index.lock': File exists`.
+- An edit by one agent is lost if the other writes the same file from what it
+  read earlier.
+
+So give the agents work that does not overlap: separate directories, one agent
+that only reads (a reviewer), and one agent that commits. Say so in the task you
+give each of them. Both commit as the same identity unless told apart:
+`DEVENV_AGENT=claude-review devenv --shared claude` commits as
+`agent-claude-review`, as long as `.env.local` does not set `DEVENV_AGENT`
+itself. When the work needs separate branches, use a clone per agent instead.
 
 ### One working tree per agent
 
@@ -322,13 +385,16 @@ way. It prints a warning; that is deliberate.
 ### Seeing what the filter rejected
 
 A rejected connection fails in the container with "connection refused". To see
-which rule it met, read the filter's counters from the host, in the project
-directory of the running session:
+which rule it met, read the filter's counters from the host, using the session
+name printed at its start:
 
 ```bash
-docker exec -u root "$(docker ps -q --filter "label=devenv=$PWD")" \
+docker exec -u root devenv-my-service-1a2b3c4d-claude-1 \
     iptables -L OUTPUT -v -n --line-numbers
 ```
+
+`docker ps --filter "label=devenv=$PWD"`, run in the project directory, lists
+the sessions there with their names. Each session has a filter of its own.
 
 `pkts` counts the packets each rule matched. Repeat the failing request and see
 which line moves: the `REJECT` at the end means nothing let it through; the
@@ -983,8 +1049,8 @@ account on most Linux installs, and the default on WSL2.
 - **`docker exec` into a running session lands as root.** Privileges are
   dropped by the entrypoint, which `docker exec` bypasses, and the image
   carries no `USER` directive because the entrypoint has to start as root to
-  apply the egress filter. Use `docker exec -u node <container> bash`, or files
-  you create land in your project owned by root.
+  apply the egress filter. Use `docker exec -u node <session name> bash`, or
+  files you create land in your project owned by root.
 - **Podman is untested.** See [Portability](#portability).
 - **An agent's own sandbox does not run without `--nested-sandbox`**, because
   docker's seccomp profile denies user namespaces. See
